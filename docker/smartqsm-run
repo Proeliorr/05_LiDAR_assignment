@@ -1,0 +1,12 @@
+#!/bin/sh
+# smartqsm-run <SmartQSM arguments>: run SmartQSM and print the error part of its log.
+# SmartQSM exits 0 and prints only "Failed." when a tree fails; the reason (the traceback, e.g. "CUDA out of memory") goes to
+# entrypoints/smartqsm.log, which it rolls over at every start. The pipeline records what is printed here.
+cd /opt/lidar/third_party/SmartQSM || exit 1
+python entrypoints/smartqsm.py "$@"
+rc=$?
+if grep -qa '[[]ERROR[]]' entrypoints/smartqsm.log 2>/dev/null; then
+    echo '--- smartqsm.log, error part ---'
+    sed -n '/[[]ERROR[]]/,$p' entrypoints/smartqsm.log | tail -n 12
+fi
+exit $rc

@@ -4,17 +4,17 @@ Trees are matched by the TREE NUMBER ONLY (reference tree number == pipeline ord
 row label ``T<k>``); no coordinates or distances are involved. Only DBH and total height are compared. All numbers
 are in **metres** (the reference is converted from its own units, see :mod:`lidar_bridge.reference`).
 
-Inputs (``<run>`` = ``data/out/<run_name>``)
+Inputs (``<run>`` = ``out/<run_name>`` in the data folder)
 -------------------------------------------
 reference table
-    ``ctx.reference`` (``reference=data/in/<file>.csv|xlsx``); columns / units from the stage parameters, the
+    ``ctx.reference`` (``--ref in/<file>.csv|xlsx``); columns / units from the stage parameters, the
     optional ``columns_file`` YAML, or auto-detection (see :mod:`lidar_bridge.reference`).
 
 pipeline ``3dfin``: ``<run>/split/tree_map.csv`` (written by the split stage)
     ``ordinal`` (int), ``dbh_m`` (empty when 3DFin found no DBH), ``th_m`` (corrected tree height, m); other
     columns are ignored.
 
-pipeline ``smartqsm:<config>``: ``<run>/smartqsm/<config>/metrics.csv`` (one per SmartQSM config; a hydra sweep over
+pipeline ``smartqsm:<config>``: ``<run>/smartqsm/<config>/metrics.csv`` (one per SmartQSM config; several runs over
 ``smartqsm.config`` creates several, each is compared under the name ``smartqsm:<config>``, also if there is one)
 pipeline ``arbor``: ``<run>/arbor/metrics.csv``
     columns ``ordinal,dbh_m,height_m,status,seconds`` (extra columns are ignored). A row counts as a valid estimate of
@@ -104,7 +104,7 @@ from lidar_bridge.stages._common import StageError, read_fingerprint, tree_map_f
 log = logging.getLogger("lidar_bridge.stages.compare")
 
 METRICS = ("dbh", "height")
-#: Name of the pipeline that is not a container stage but the 3DFin values from ``split/tree_map.csv``.
+#: Name of the pipeline that is not a tool stage but the 3DFin values from ``split/tree_map.csv``.
 PIPELINE_3DFIN = "3dfin"
 ERROR_COLUMNS = ["pipeline", "metric", "ordinal", "ref", "est", "error", "rel_error_pct", "id_confidence", "estimated"]
 SUMMARY_COLUMNS = [
@@ -619,7 +619,7 @@ def run_compare(
         return {"dir": str(ctx.rel(out_dir)), "dry_run": True}
 
     if ctx.reference is None:
-        raise StageError("the compare stage needs a reference table: pass reference=data/in/<file>.csv|xlsx")
+        raise StageError("the compare stage needs a reference table: pass --ref in/<file>.csv|xlsx")
     reference = refmod.load_reference(ctx.reference, spec)
 
     found, missing, unverified = discover_pipelines(ctx, allow_stale=allow_stale)

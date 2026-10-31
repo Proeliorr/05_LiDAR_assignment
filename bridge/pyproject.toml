@@ -5,11 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "lidar-bridge"
 version = "0.1.0"
-description = "Orchestrator for the 3DFin -> (SmartQSM | arbor) -> reference-comparison LiDAR pipeline. Launches the stage containers through the mounted docker socket."
+description = "The 3DFin -> (SmartQSM | arbor) -> reference-comparison LiDAR pipeline, run inside one container with a mamba environment per tool."
 requires-python = ">=3.12"
 dependencies = [
-    "hydra-zen>=0.13",
-    "hydra-core>=1.3.2",
     "laspy[lazrs]>=2.5",
     "numpy",
     "pandas",

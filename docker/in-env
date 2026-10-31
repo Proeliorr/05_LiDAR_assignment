@@ -1,0 +1,10 @@
+#!/bin/bash
+# in-env <environment> <command> [args...]: run a command in a mamba environment.
+# `exec` after a real activation, not `conda run`: activation scripts set GDAL_DATA, PROJ_DATA and the like, and exec hands
+# stdin, output and signals straight to the tool.
+set -e
+env_name="$1"
+shift
+source /opt/conda/etc/profile.d/conda.sh
+conda activate "$env_name"
+exec "$@"

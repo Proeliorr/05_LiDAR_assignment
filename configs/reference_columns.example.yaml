@@ -1,18 +1,18 @@
 # Column mapping for the `compare` stage: where the plot reference measurements (the table passed as
-# `reference=data/in/<file>.csv|xlsx`) keep the tree number, DBH and tree height.
+# `--ref in/<file>.csv|xlsx`) keep the tree number, DBH and tree height.
 #
 # You usually do NOT need this file: without it the columns are auto-detected by title, case/accent-insensitively
 # (tree number: tree, tree_id, id, nr, numer, "nr drzewa", lp ...; DBH: dbh, d13, d1.3, "DBH [cm]", pierśnica ...;
 # height: h, th, height, wysokość, wys ...), the unit is read from the title ("DBH [cm]", "H (m)") or defaults to
 # cm for DBH and m for height (a unit that comes from this DEFAULT is checked: a DBH median below 1 [metres?] or
 # above 150 [millimetres?], or a height median above 120 [cm / mm?] stops the stage with an error that names the unit
-# to set; state the unit in the title, here or with compare.dbh_unit=... and the check only warns), and csv
+# to set; state the unit in the title, here or with dbh_unit under compare in the --params file, and the check only warns), and csv
 # delimiter / decimal comma / encoding are detected. If detection is ambiguous
-# the stage stops and lists the columns it found; then copy this file to configs/reference_columns.yaml, adjust it
-# and pass it with
-#     compare.columns_file=configs/reference_columns.yaml
+# the stage stops and lists the columns it found; then copy this file into your data folder as reference_columns.yaml, adjust it
+# and name it in the --params file:
+#     compare: {columns_file: reference_columns.yaml}
 # Every key is optional (omit it or leave it empty for auto-detection). Precedence per setting:
-# explicit stage parameter (compare.dbh_col=..., compare.dbh_unit=cm, compare.sheet=...) > this file > auto-detection.
+# explicit stage parameter (dbh_col, dbh_unit, sheet under compare in the --params file) > this file > auto-detection.
 #
 # Rows are joined to the pipeline results on the TREE NUMBER ONLY (reference tree number == ordinal tree number
 # 1..N == 3DFin row label T<k>); no coordinates or distances are involved. "T12", "12" and 12.0 are all tree 12.

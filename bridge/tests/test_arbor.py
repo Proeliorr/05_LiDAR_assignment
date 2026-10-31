@@ -1,4 +1,4 @@
-"""Tests of the arbor stage with a mocked ``run_container`` (the real R/arbor run is checked manually, see the README/report)."""
+"""Tests of the arbor stage with a mocked ``run_tool`` (the real R/arbor run is checked manually, see the README/report)."""
 
 from __future__ import annotations
 
@@ -9,12 +9,11 @@ from pathlib import Path
 
 import pytest
 
-from lidar_bridge.docker_runner import DockerRunError, Mount
 from lidar_bridge.paths import RunContext
+from lidar_bridge.runner import ToolError
 from lidar_bridge.stages import arbor
 from lidar_bridge.stages._common import FINGERPRINT_FILE, StageError, read_fingerprint, tree_map_fingerprint
 
-HOST = "D:/Podyplomowe/05_Proximity_Lidar"
 ORDINALS = [1, 2, 3, 4, 5]
 LOW_POINTS = {4}
 R_SOURCE = Path(__file__).resolve().parents[1] / "r" / "arbor_metrics.R"
@@ -71,22 +70,22 @@ def run_dir(project: Path) -> Path:
     return project / "data" / "out" / "r1"
 
 
-class FakeDocker:
-    """Replaces ``run_container`` in the arbor module and plays the R script: appends one row per tree to ``--out_csv``."""
+class FakeTool:
+    """Replaces ``run_tool`` in the arbor module and plays the R script: appends one row per tree to ``--out_csv``."""
 
     def __init__(self, ctx: RunContext, *, returncode: int = 0, write: bool = True, stdout: str = PROGRESS_OUTPUT, skip_ordinals=()):
         self.ctx, self.returncode, self.write, self.stdout, self.skip_ordinals = ctx, returncode, write, stdout, set(skip_ordinals)
         self.calls: list[dict] = []
 
-    def host_path(self, container_path: str) -> Path:
-        assert container_path.startswith("/data/")
-        return self.ctx.data_dir / container_path[len("/data/") :]
+    def host_path(self, path: str) -> Path:
+        assert Path(path).is_absolute() and Path(path).is_relative_to(self.ctx.data_dir)
+        return Path(path)
 
-    def __call__(self, image, args, mounts=(), **kw):
+    def __call__(self, env, args, **kw):
         args = list(args)
-        self.calls.append(dict(image=image, args=args, mounts=list(mounts), **kw))
+        self.calls.append(dict(env=env, args=args, **kw))
         if kw.get("dry_run"):
-            return subprocess.CompletedProcess(["docker"], 0, stdout="", stderr=None)
+            return subprocess.CompletedProcess(["in-env"], 0, stdout="", stderr=None)
         opts = {a: args[i + 1] for i, a in enumerate(args) if a.startswith("--") and i + 1 < len(args) and not args[i + 1].startswith("--")}
         out_csv = self.host_path(opts["--out_csv"])
         if self.write:
@@ -107,15 +106,14 @@ class FakeDocker:
                 rows.append(metrics_row(o, "skipped_low_points" if low else "ok", mode=mode))
             write_metrics(out_csv, rows)
         if self.returncode:
-            raise DockerRunError(f"container exited with code {self.returncode}", returncode=self.returncode, output=self.stdout)
-        return subprocess.CompletedProcess(["docker"], 0, stdout=self.stdout, stderr=None)
+            raise ToolError(f"arbor exited with code {self.returncode}", returncode=self.returncode, output=self.stdout)
+        return subprocess.CompletedProcess(["in-env"], 0, stdout=self.stdout, stderr=None)
 
 
 @pytest.fixture
 def fake(monkeypatch, ctx, run_dir):
-    f = FakeDocker(ctx)
-    monkeypatch.setattr(arbor, "run_container", f)
-    monkeypatch.setattr(arbor, "require_image", lambda *a, **k: None)
+    f = FakeTool(ctx)
+    monkeypatch.setattr(arbor, "run_tool", f)
     return f
 
 
@@ -154,31 +152,28 @@ def ordinals_of(path: Path) -> list[int]:
 
 
 # -- command construction -------------------------------------------------------------------------------------
-def test_per_tree_command_mounts_and_env(ctx, fake, run_dir):
+def test_per_tree_command_and_env(ctx, fake, run_dir):
     result = arbor.run_arbor(ctx)
     (call,) = fake.calls
-    assert call["image"] == "lidar-arbor" and call["network"] == "none"
-    assert call["env"] == {"OMP_NUM_THREADS": "8"}
-    assert call["mounts"] == [
-        Mount(f"{HOST}/data", "/data"),
-        Mount(f"{HOST}/bridge/r", "/bridge_r", readonly=True),
-    ]
+    data = ctx.data_dir
+    assert call["env"] == "arbor"
+    assert call["extra_env"] == {"OMP_NUM_THREADS": "8"}
     args = call["args"]
-    assert args[0] == "/bridge_r/arbor_metrics.R"  # the image's ENTRYPOINT is Rscript
+    assert args[:2] == ["Rscript", str(ctx.install_dir / "bridge" / "r" / "arbor_metrics.R")]
     assert option(args, "--mode") == "per_tree"
-    assert option(args, "--trees_dir") == "/data/out/r1/split/trees"
-    assert option(args, "--tree_map") == "/data/out/r1/split/tree_map.csv"
-    assert option(args, "--out_csv") == "/data/out/r1/arbor/metrics.csv"
+    assert option(args, "--trees_dir") == str(data / "out/r1/split/trees")
+    assert option(args, "--tree_map") == str(data / "out/r1/split/tree_map.csv")
+    assert option(args, "--out_csv") == str(data / "out/r1/arbor/metrics.csv")
     assert option(args, "--threads") == "8" and option(args, "--skip_low_points") == "true"
     for absent in ("--trees", "--limit", "--resume", "--homogenize", "--params", "--plot_las", "--max_match_dist"):
         assert absent not in args
     assert call["timeout_s"] == 7200
     assert (run_dir / "arbor" / "metrics.csv").is_file()
-    assert result["metrics"] == "data/out/r1/arbor/metrics.csv" and result["mode"] == "per_tree"
+    assert result["metrics"] == "out/r1/arbor/metrics.csv" and result["mode"] == "per_tree"
     assert result["n_trees"] == 5 and result["counts"] == {"ok": 4, "skipped_low_points": 1} and result["skipped"] is False
 
 
-def test_one_container_run_for_all_trees(ctx, fake):
+def test_one_tool_run_for_all_trees(ctx, fake):
     arbor.run_arbor(ctx)
     assert len(fake.calls) == 1
 
@@ -187,7 +182,7 @@ def test_threads_limit_selection_and_flags(ctx, fake):
     arbor.run_arbor(ctx, threads=4, trees=[3, 1, 3], limit=1, skip_low_points=False, homogenize=True, timeout_s=0)
     call = fake.calls[0]
     args = call["args"]
-    assert call["env"] == {"OMP_NUM_THREADS": "4"} and option(args, "--threads") == "4"
+    assert call["extra_env"] == {"OMP_NUM_THREADS": "4"} and option(args, "--threads") == "4"
     assert option(args, "--trees") == "1,3" and option(args, "--limit") == "1"
     assert option(args, "--skip_low_points") == "false"
     assert "--homogenize" in args
@@ -216,7 +211,7 @@ def test_params_are_forwarded_flattened(ctx, fake):
         (dict(params={"qsm.a": "1,2"}), "no ','"),
     ],
 )
-def test_invalid_arguments_fail_before_docker(ctx, fake, kwargs, message):
+def test_invalid_arguments_fail_before_the_tool_starts(ctx, fake, kwargs, message):
     with pytest.raises(StageError, match=message):
         arbor.run_arbor(ctx, **kwargs)
     assert fake.calls == []
@@ -252,7 +247,7 @@ def test_unreadable_tree_map(ctx, fake, run_dir):
 
 
 # -- resume / force ---------------------------------------------------------------------------------------------
-def test_second_run_finds_everything_done_and_starts_no_container(ctx, fake):
+def test_second_run_finds_everything_done_and_starts_no_tool(ctx, fake):
     arbor.run_arbor(ctx)
     result = arbor.run_arbor(ctx)
     assert len(fake.calls) == 1 and result["skipped"] is True and result["n_trees"] == 5
@@ -290,13 +285,12 @@ def test_resume_false_and_force_start_from_scratch(ctx, fake, run_dir):
 def test_force_discards_stale_files_before_the_run(ctx, monkeypatch, run_dir):
     seen = {}
 
-    def fake_run(image, args, mounts=(), **kw):
+    def fake_run(env, args, **kw):
         seen["csv"] = (run_dir / "arbor" / "metrics.csv").exists()
         seen["log"] = (run_dir / "arbor" / "arbor.log").exists()
-        raise DockerRunError("boom", returncode=1, output="")
+        raise ToolError("boom", returncode=1, output="")
 
-    monkeypatch.setattr(arbor, "run_container", fake_run)
-    monkeypatch.setattr(arbor, "require_image", lambda *a, **k: None)
+    monkeypatch.setattr(arbor, "run_tool", fake_run)
     write_metrics(run_dir / "arbor" / "metrics.csv", [metrics_row(1)])
     (run_dir / "arbor" / "arbor.log").write_text("old", encoding="utf-8")
     with pytest.raises(StageError):
@@ -306,7 +300,7 @@ def test_force_discards_stale_files_before_the_run(ctx, monkeypatch, run_dir):
 
 def test_table_of_another_layout_is_an_error_unless_forced(ctx, fake, run_dir):
     write_metrics(run_dir / "arbor" / "metrics.csv", [{"ordinal": 1, "dbh_m": "0.1"}], columns=["ordinal", "dbh_m"])
-    with pytest.raises(StageError, match="force=True"):
+    with pytest.raises(StageError, match="--force"):
         arbor.run_arbor(ctx)
     assert fake.calls == []
     arbor.run_arbor(ctx, force=True)
@@ -390,14 +384,13 @@ def test_stale_table_and_log_are_deleted_before_the_run(ctx, monkeypatch, run_di
     (run_dir / "arbor" / "arbor.log").write_text("old", encoding="utf-8")
     seen = {}
 
-    def fake_run(image, args, mounts=(), **kw):
+    def fake_run(env, args, **kw):
         seen["csv"] = (run_dir / "arbor" / "metrics.csv").exists()
         seen["log"] = (run_dir / "arbor" / "arbor.log").exists()
         seen["fingerprint"] = read_fingerprint(run_dir / "arbor")
-        raise DockerRunError("boom", returncode=1, output="")
+        raise ToolError("boom", returncode=1, output="")
 
-    monkeypatch.setattr(arbor, "run_container", fake_run)
-    monkeypatch.setattr(arbor, "require_image", lambda *a, **k: None)
+    monkeypatch.setattr(arbor, "run_tool", fake_run)
     with pytest.raises(StageError):
         arbor.run_arbor(ctx)
     assert seen == {"csv": False, "log": False, "fingerprint": (tree_map_fingerprint(run_dir / "split"), DEFAULT_TAG)}
@@ -458,13 +451,12 @@ def test_force_ignores_the_fingerprint_without_a_stale_warning(ctx, fake, run_di
 
 
 def test_interrupted_run_keeps_its_fingerprint_so_the_partial_table_is_resumed(ctx, run_dir, monkeypatch, caplog):
-    monkeypatch.setattr(arbor, "require_image", lambda *a, **k: None)
-    monkeypatch.setattr(arbor, "run_container", FakeDocker(ctx, returncode=1, stdout="FATAL: killed\n"))  # rows written, then the container dies
+    monkeypatch.setattr(arbor, "run_tool", FakeTool(ctx, returncode=1, stdout="FATAL: killed\n"))  # rows written, then the tool dies
     with pytest.raises(StageError):
         arbor.run_arbor(ctx, limit=2)
     assert read_fingerprint(run_dir / "arbor") == (tree_map_fingerprint(run_dir / "split"), DEFAULT_TAG)
-    good = FakeDocker(ctx)
-    monkeypatch.setattr(arbor, "run_container", good)
+    good = FakeTool(ctx)
+    monkeypatch.setattr(arbor, "run_tool", good)
     with caplog.at_level("WARNING", logger="lidar_bridge.stages.arbor"):
         arbor.run_arbor(ctx)
     assert "recomputing" not in caplog.text and "--resume" in good.calls[0]["args"]
@@ -495,10 +487,9 @@ def test_dry_run_with_stale_results_changes_nothing(project, run_dir, monkeypatc
     seed_results(run_dir, [metrics_row(1), metrics_row(2)], fingerprint="0123456789abcdef")  # another split
     (arbor_dir / "arbor.log").write_text("old", encoding="utf-8")
     before = {p.name: p.read_bytes() for p in arbor_dir.iterdir()}
-    dry = RunContext(run_name="r1", host_project_dir=HOST, project_dir=project, dry_run=True)
+    dry = RunContext(run_name="r1", data_dir=project / "data", install_dir=project, dry_run=True)
     calls = []
-    monkeypatch.setattr(arbor, "run_container", lambda *a, **k: calls.append((a, k)) or subprocess.CompletedProcess(["docker"], 0, stdout="", stderr=None))
-    monkeypatch.setattr(arbor, "require_image", lambda *a, **k: None)
+    monkeypatch.setattr(arbor, "run_tool", lambda *a, **k: calls.append((a, k)) or subprocess.CompletedProcess(["in-env"], 0, stdout="", stderr=None))
     with caplog.at_level("WARNING", logger="lidar_bridge.stages.arbor"):
         result = arbor.run_arbor(dry)
     assert result["dry_run"] is True and "[dry-run]" in caplog.text and "split/dfin changed" in caplog.text
@@ -508,59 +499,43 @@ def test_dry_run_with_stale_results_changes_nothing(project, run_dir, monkeypatc
 
 
 # -- failures ---------------------------------------------------------------------------------------------------
-def test_container_failure_is_a_stage_error_and_keeps_partial_rows(ctx, run_dir, monkeypatch):
-    f = FakeDocker(ctx, returncode=1, stdout="Anisotropy: 5% | ETA\rAnisotropy: 6% | ETA\rFATAL: out of memory\n")
-    monkeypatch.setattr(arbor, "run_container", f)
-    monkeypatch.setattr(arbor, "require_image", lambda *a, **k: None)
+def test_tool_failure_is_a_stage_error_and_keeps_partial_rows(ctx, run_dir, monkeypatch):
+    f = FakeTool(ctx, returncode=1, stdout="Anisotropy: 5% | ETA\rAnisotropy: 6% | ETA\rFATAL: out of memory\n")
+    monkeypatch.setattr(arbor, "run_tool", f)
     with pytest.raises(StageError) as err:
         arbor.run_arbor(ctx)
     text = str(err.value)
-    assert "arbor container failed" in text and "FATAL: out of memory" in text and "Anisotropy" not in text
+    assert "arbor failed" in text and "FATAL: out of memory" in text and "Anisotropy" not in text
     assert "resume=True" in text  # the partial table is there
     assert (run_dir / "arbor" / "metrics.csv").is_file()
     assert "FATAL: out of memory" in (run_dir / "arbor" / "arbor.log").read_text(encoding="utf-8")
 
 
-def test_container_ok_but_no_csv(ctx, run_dir, monkeypatch):
-    monkeypatch.setattr(arbor, "run_container", FakeDocker(ctx, write=False))
-    monkeypatch.setattr(arbor, "require_image", lambda *a, **k: None)
+def test_tool_ok_but_no_csv(ctx, run_dir, monkeypatch):
+    monkeypatch.setattr(arbor, "run_tool", FakeTool(ctx, write=False))
     with pytest.raises(StageError, match="produced no metrics.csv"):
         arbor.run_arbor(ctx)
 
 
 def test_csv_missing_a_selected_tree(ctx, run_dir, monkeypatch):
-    monkeypatch.setattr(arbor, "run_container", FakeDocker(ctx, skip_ordinals=[2, 5]))
-    monkeypatch.setattr(arbor, "require_image", lambda *a, **k: None)
+    monkeypatch.setattr(arbor, "run_tool", FakeTool(ctx, skip_ordinals=[2, 5]))
     with pytest.raises(StageError, match=r"no row for 2 selected tree.*\[2, 5\]"):
-        arbor.run_arbor(ctx)
-
-
-def test_missing_image_is_reported(ctx, run_dir, monkeypatch):
-    from lidar_bridge.docker_runner import ImageNotFoundError
-
-    def no_image(tag, **kw):
-        raise ImageNotFoundError("docker image 'lidar-arbor' not found")
-
-    monkeypatch.setattr(arbor, "require_image", no_image)
-    monkeypatch.setattr(arbor, "run_container", FakeDocker(ctx))
-    with pytest.raises(ImageNotFoundError):
         arbor.run_arbor(ctx)
 
 
 def test_per_tree_row_problems_are_not_stage_errors(ctx, run_dir, monkeypatch):
     """A tree that failed inside R is a row, not a failure of the stage."""
-    f = FakeDocker(ctx)
+    f = FakeTool(ctx)
 
-    def run(image, args, mounts=(), **kw):
-        out = f(image, args, mounts, **kw)
+    def run(env, args, **kw):
+        out = f(env, args, **kw)
         rows = read_rows(run_dir / "arbor" / "metrics.csv")
         rows[0].update(status="failed", dbh_m="", height_m="", note="qsm failed")
         rows[1].update(status="error", dbh_m="", height_m="", note="tree file not found")
         write_metrics(run_dir / "arbor" / "metrics.csv", rows)
         return out
 
-    monkeypatch.setattr(arbor, "run_container", run)
-    monkeypatch.setattr(arbor, "require_image", lambda *a, **k: None)
+    monkeypatch.setattr(arbor, "run_tool", run)
     result = arbor.run_arbor(ctx)
     assert result["counts"] == {"failed": 1, "error": 1, "ok": 2, "skipped_low_points": 1}
 
@@ -592,12 +567,12 @@ def test_plot_mode_command_and_separate_output(ctx, fake, run_dir):
     (call,) = fake.calls
     args = call["args"]
     assert option(args, "--mode") == "plot"
-    assert option(args, "--plot_las") == "/data/out/r1/dfin/plot_01_tree_ID_dist_axes.las"
+    assert option(args, "--plot_las") == str(ctx.data_dir / "out/r1/dfin/plot_01_tree_ID_dist_axes.las")
     assert option(args, "--max_match_dist") == "0.75"
-    assert option(args, "--out_csv") == "/data/out/r1/arbor/metrics_plot.csv"
+    assert option(args, "--out_csv") == str(ctx.data_dir / "out/r1/arbor/metrics_plot.csv")
     assert "--trees_dir" not in args and "--resume" not in args and "--homogenize" not in args
-    assert call["env"] == {"OMP_NUM_THREADS": "6"}
-    assert result["metrics"] == "data/out/r1/arbor/metrics_plot.csv" and result["log"].endswith("arbor_plot.log")
+    assert call["extra_env"] == {"OMP_NUM_THREADS": "6"}
+    assert result["metrics"] == "out/r1/arbor/metrics_plot.csv" and result["log"].endswith("arbor_plot.log")
     assert (run_dir / "arbor" / "metrics.csv").read_text(encoding="utf-8") == before  # compare's input is untouched
     assert {r["mode"] for r in read_rows(run_dir / "arbor" / "metrics_plot.csv")} == {"plot"}
     assert (run_dir / "arbor" / "arbor_plot.log").is_file() and not (run_dir / "arbor" / "arbor.log").exists()
@@ -625,18 +600,17 @@ def test_plot_mode_needs_the_dfin_cloud(ctx, fake, run_dir):
 
 def test_find_dfin_cloud_prefers_the_input_stem(ctx, run_dir):
     (run_dir / "dfin" / "other_tree_ID_dist_axes.las").write_bytes(b"x")
-    assert arbor.find_dfin_cloud(ctx).name == "plot_01_tree_ID_dist_axes.las"  # ctx.input is data/in/plot_01.laz
-    no_input = RunContext(run_name="r1", host_project_dir=HOST, project_dir=ctx.project_dir)
+    assert arbor.find_dfin_cloud(ctx).name == "plot_01_tree_ID_dist_axes.las"  # ctx.input is in/plot_01.laz
+    no_input = RunContext(run_name="r1", data_dir=ctx.data_dir, install_dir=ctx.install_dir)
     with pytest.raises(StageError, match="several 3DFin clouds"):
         arbor.find_dfin_cloud(no_input)
 
 
 # -- dry run ----------------------------------------------------------------------------------------------------
 def test_dry_run_only_logs_the_command(project, run_dir, monkeypatch):
-    dry = RunContext(run_name="r1", host_project_dir=HOST, project_dir=project, dry_run=True)
+    dry = RunContext(run_name="r1", data_dir=project / "data", install_dir=project, dry_run=True)
     calls = []
-    monkeypatch.setattr(arbor, "run_container", lambda *a, **k: calls.append((a, k)) or subprocess.CompletedProcess(["docker"], 0, stdout="", stderr=None))
-    monkeypatch.setattr(arbor, "require_image", lambda *a, **k: None)
+    monkeypatch.setattr(arbor, "run_tool", lambda *a, **k: calls.append((a, k)) or subprocess.CompletedProcess(["in-env"], 0, stdout="", stderr=None))
     result = arbor.run_arbor(dry, trees=[2])
     assert result["dry_run"] is True
     ((args, kwargs),) = calls
@@ -645,11 +619,10 @@ def test_dry_run_only_logs_the_command(project, run_dir, monkeypatch):
 
 
 def test_dry_run_tolerates_missing_inputs(project, monkeypatch, caplog):
-    dry = RunContext(run_name="nothing", host_project_dir=HOST, project_dir=project, dry_run=True)
+    dry = RunContext(run_name="nothing", data_dir=project / "data", install_dir=project, dry_run=True)
     (project / "bridge" / "r").mkdir(parents=True)
     calls = []
-    monkeypatch.setattr(arbor, "run_container", lambda *a, **k: calls.append(a) or subprocess.CompletedProcess(["docker"], 0, stdout="", stderr=None))
-    monkeypatch.setattr(arbor, "require_image", lambda *a, **k: None)
+    monkeypatch.setattr(arbor, "run_tool", lambda *a, **k: calls.append(a) or subprocess.CompletedProcess(["in-env"], 0, stdout="", stderr=None))
     with caplog.at_level("WARNING"):
         arbor.run_arbor(dry, mode="plot", trees=[5, 1])
     assert len(calls) == 1 and option(list(calls[0][1]), "--trees") == "1,5"
@@ -732,27 +705,3 @@ def test_select_ordinals():
     assert arbor.select_ordinals([3, 1, 2], None) == [1, 2, 3]
     assert arbor.select_ordinals([1, 2, 3], [3, 3, 1]) == [1, 3]
     assert arbor.select_ordinals([1, 2, 3], None, limit=2) == [1, 2]
-
-
-# -- hydra ------------------------------------------------------------------------------------------------------------
-def test_hydra_config_exposes_the_new_parameters(tmp_path):
-    from hydra import compose, initialize_config_dir
-    from hydra.core.global_hydra import GlobalHydra
-    from hydra_zen import instantiate
-
-    from lidar_bridge.configs import CONFIG_NAME, register_configs
-
-    register_configs()
-    GlobalHydra.instance().clear()
-    try:
-        with initialize_config_dir(config_dir=str(tmp_path), version_base="1.3"):
-            cfg = compose(config_name=CONFIG_NAME, overrides=["arbor.trees=[3,8]", "arbor.limit=2", "arbor.mode=plot", "arbor.threads=4", "+arbor.params.qsm.smooth_steps=20"])
-            default = compose(config_name=CONFIG_NAME)
-    finally:
-        GlobalHydra.instance().clear()
-    kw = instantiate(cfg.arbor).keywords
-    assert kw["trees"] == [3, 8] and kw["limit"] == 2 and kw["mode"] == "plot" and kw["threads"] == 4
-    assert kw["params"] == {"qsm": {"smooth_steps": 20}}
-    d = default.arbor
-    assert d.trees is None and d.limit is None and d.threads == 8 and d.skip_low_points is True
-    assert d.resume is True and d.force is False and d.max_match_dist == 1.0 and d.homogenize is False

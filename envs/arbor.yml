@@ -1,0 +1,15 @@
+# R and the dependencies of arbor. arbor itself is compiled from third_party/arbor (see the Dockerfile).
+name: arbor
+channels:
+  - conda-forge
+dependencies:
+  - r-base=4.5
+  - r-lidr=4.3.2
+  - r-sf
+  - r-rgl
+  - r-data.table
+  - r-rcpp
+  - r-optparse
+  - c-compiler
+  - cxx-compiler
+  - make

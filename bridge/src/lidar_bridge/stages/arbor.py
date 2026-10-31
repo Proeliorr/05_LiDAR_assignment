@@ -1,4 +1,4 @@
-"""Stage 3b (WP6b): DBH / height / volume of every 3DFin tree with the R package ``arbor`` in the ``lidar-arbor`` container.
+"""Stage 3b (WP6b): DBH / height / volume of every 3DFin tree with the R package ``arbor`` in the ``arbor`` environment.
 
 Contract
 --------
@@ -12,12 +12,11 @@ The compare stage reads ``arbor/metrics.csv`` only, so ``per_tree`` (the default
 silently replaces it; to compare the plot run too, ``compare`` has to be pointed at ``arbor/metrics_plot.csv`` (a pipeline named
 e.g. ``arbor_plot``). The two modes live side by side in ``arbor/`` and do not delete each other.
 
-ONE container runs all trees (R start-up and package loading cost ~10 s)::
+ONE R process runs all trees (R start-up and package loading cost ~10 s)::
 
-    docker run --rm --network none -e OMP_NUM_THREADS=<threads> \
-        --mount ...data:/data --mount ...bridge/r:/bridge_r,readonly lidar-arbor \
-        /bridge_r/arbor_metrics.R --mode per_tree --trees_dir /data/out/<run>/split/trees \
-        --tree_map /data/out/<run>/split/tree_map.csv --out_csv /data/out/<run>/arbor/metrics.csv --threads <threads> [...]
+    OMP_NUM_THREADS=<threads> in-env arbor Rscript /opt/lidar/bridge/r/arbor_metrics.R --mode per_tree \
+        --trees_dir /data/out/<run>/split/trees --tree_map /data/out/<run>/split/tree_map.csv \
+        --out_csv /data/out/<run>/arbor/metrics.csv --threads <threads> [...]
 
 The R script (``bridge/r/arbor_metrics.R``, its header documents the arbor chain and every height reference) appends one row to
 the CSV after EVERY tree, so an interrupted run keeps what it did and ``resume=True`` continues with the missing ordinals.
@@ -49,7 +48,7 @@ note, mode, match_dist_m``
 Stale results
 -------------
 The rows of ``metrics.csv`` are only valid for the split they were computed on and for the settings that change what arbor
-computes. Before the container starts the stage writes ``arbor/source_fingerprint.txt`` (plot mode:
+computes. Before R starts the stage writes ``arbor/source_fingerprint.txt`` (plot mode:
 ``arbor/source_fingerprint_plot.txt``, so that the two modes do not overwrite each other's record): line 1 = hash of
 ``split/tree_map.csv`` (changes whenever dfin / split change), line 2 = the settings, ``mode=per_tree homogenize=false
 params=<hash|none> skip_low_points=true`` (plot: ``mode=plot max_match_dist=1 params=<hash|none> skip_low_points=true``).
@@ -73,17 +72,16 @@ from typing import Any
 
 import pandas as pd
 
-from lidar_bridge.docker_runner import DockerRunError, require_image, run_container
 from lidar_bridge.paths import RunContext
+from lidar_bridge.runner import ENV_ARBOR, ToolError, run_tool
 from lidar_bridge.stages._common import FINGERPRINT_FILE, StageError, read_fingerprint, tree_map_fingerprint, write_fingerprint
 
 log = logging.getLogger("lidar_bridge.stages.arbor")
 
 ARBOR_MODES = ("per_tree", "plot")
-#: The R script (relative to the project) and where it is mounted (read-only) in the container.
+#: The R script, relative to the install directory.
 R_SCRIPT_DIR = Path("bridge/r")
 R_SCRIPT = "arbor_metrics.R"
-R_MOUNT = "/bridge_r"
 DFIN_CLOUD_SUFFIX = "_tree_ID_dist_axes.las"
 
 #: Exact column order of the metrics file (must equal CONTRACT_COLS in ``arbor_metrics.R``).
@@ -218,7 +216,7 @@ def find_dfin_cloud(ctx: RunContext) -> Path:
     """``dfin/<stem>_tree_ID_dist_axes.las`` of this run (plot mode input)."""
     dfin_dir = ctx.stage_dir("dfin")
     if not dfin_dir.is_dir():
-        raise StageError(f"no 3DFin results in {dfin_dir}: run the dfin stage first (stages=[dfin,arbor], mode=plot needs its cloud)")
+        raise StageError(f"no 3DFin results in {dfin_dir}: run the dfin stage first (--stages dfin,arbor; mode=plot needs its cloud)")
     if ctx.input is not None:
         candidate = dfin_dir / f"{ctx.input.stem}{DFIN_CLOUD_SUFFIX}"
         if candidate.is_file():
@@ -293,7 +291,7 @@ def _existing_ordinals(path: Path) -> list[int]:
     try:
         return sorted(read_metrics(path)["ordinal"].tolist())
     except StageError as exc:
-        raise StageError(f"cannot resume from {path}: {exc}. Use force=True to discard it.") from exc
+        raise StageError(f"cannot resume from {path}: {exc}. Use --force to discard it.") from exc
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -355,8 +353,7 @@ def run_arbor(
     ctx: RunContext,
     *,
     mode: str = "per_tree",
-    image: str = "lidar-arbor",
-    params: dict = {},  # noqa: B006  (never mutated; hydra-zen turns it into a config field)
+    params: dict | None = None,
     timeout_s: int = 7200,
     trees: list[int] | None = None,
     limit: int | None = None,
@@ -367,7 +364,7 @@ def run_arbor(
     max_match_dist: float = 1.0,
     homogenize: bool = False,
 ) -> dict:
-    """Run arbor (image ``lidar-arbor``) on the 3DFin trees and write ``arbor/metrics.csv`` (see the module docstring).
+    """Run arbor on the 3DFin trees and write ``arbor/metrics.csv`` (see the module docstring).
 
     Parameters
     ----------
@@ -375,23 +372,21 @@ def run_arbor(
         ``per_tree``: one QSM per ``split/trees/tree_XXXX.laz`` (default; feeds ``compare``). ``plot``: arbor's scene
         pipeline once on the whole 3DFin cloud (needs the dfin stage), results matched to the ordinals; written to
         ``metrics_plot.csv``.
-    image
-        Docker image tag (ENTRYPOINT ``Rscript``).
     params
         arbor parameter overrides ``{"qsm": {"smooth_steps": 20}}`` / ``{"qsm.smooth_steps": 20}`` (keys of
-        ``arbor_parameters_default``; CLI: ``+arbor.params.qsm.smooth_steps=20``).
+        ``arbor_parameters_default``; set it in the ``--params`` file).
     timeout_s
-        Limit of the single container run, seconds (0 = no limit). A full 123-tree per_tree run takes ~5 min.
+        Limit of the single R run, seconds (0 = no limit). A full 123-tree per_tree run takes ~5 min.
     trees
-        Only these ordinals (CLI: ``arbor.trees=[3,8,10]``); default all trees of ``tree_map.csv``.
+        Only these ordinals (CLI: ``--trees 3,8,10``); default all trees of ``tree_map.csv``.
     limit
         Process at most this many trees (the first ones; per_tree: of those not yet done).
     threads
-        OpenMP threads of arbor (``OMP_NUM_THREADS`` of the container) and lidR/data.table threads.
+        OpenMP threads of arbor (``OMP_NUM_THREADS``) and lidR/data.table threads.
     skip_low_points
         Trees flagged ``low_points`` in ``tree_map.csv`` get status ``skipped_low_points`` instead of being processed.
     resume
-        per_tree: keep the rows already in ``metrics.csv`` and process only the missing ordinals; nothing to do -> no container.
+        per_tree: keep the rows already in ``metrics.csv`` and process only the missing ordinals; nothing to do -> R is not started.
         plot: reuse the table if it already covers every selected ordinal. ``False`` starts from scratch. Only a table made on the
         current split with the current settings is resumed (module docstring, "Stale results"); any other is discarded with a
         warning and recomputed.
@@ -406,7 +401,7 @@ def run_arbor(
     Returns
     -------
     dict
-        ``{"dir", "metrics", "log", "mode", "n_trees", "counts", "seconds", "skipped"}``; paths relative to the project.
+        ``{"dir", "metrics", "log", "mode", "n_trees", "counts", "seconds", "skipped"}``; paths relative to the data folder.
     """
     if mode not in ARBOR_MODES:
         raise StageError(f"arbor.mode must be one of {ARBOR_MODES}, got {mode!r}")
@@ -424,16 +419,16 @@ def run_arbor(
     split_dir = ctx.stage_dir("split")
     tree_map_path = split_dir / "tree_map.csv"
     trees_dir = split_dir / "trees"
-    script_dir = ctx.project_dir / R_SCRIPT_DIR
+    script_dir = ctx.install_dir / R_SCRIPT_DIR
 
     # -- inputs ----------------------------------------------------------------------------------------------
     problems = []
     if not tree_map_path.is_file():
-        problems.append(f"{ctx.rel(tree_map_path)} not found: run the split stage first (stages=[split,arbor])")
+        problems.append(f"{ctx.rel(tree_map_path)} not found: run the split stage first (--stages split,arbor)")
     if mode == "per_tree" and not trees_dir.is_dir():
         problems.append(f"{ctx.rel(trees_dir)} not found: run the split stage first")
     if not (script_dir / R_SCRIPT).is_file():
-        problems.append(f"{R_SCRIPT_DIR / R_SCRIPT} not found in the project")
+        problems.append(f"{script_dir / R_SCRIPT} not found")
     plot_cloud: Path | None = None
     if mode == "plot":
         try:
@@ -475,28 +470,27 @@ def run_arbor(
         expected = sorted(target)
         reuse = False
     if selected is not None and not todo and not fresh and metrics_path.is_file():
-        log.info("arbor %s: %s already holds all %d selected tree(s); nothing to run (force=True re-runs)", mode, metrics_path.name, len(done))
+        log.info("arbor %s: %s already holds all %d selected tree(s); nothing to run (--force re-runs)", mode, metrics_path.name, len(done))
         return _summary(ctx, out_dir, metrics_path, log_path, mode, read_metrics(metrics_path), 0.0, skipped=True)
     if (fresh or mode == "plot") and not ctx.dry_run:
         for stale in (metrics_path, log_path):
             if stale.exists():
                 stale.unlink()
     if reuse and params_arg:
-        log.warning("%s will be extended although arbor.params is set; use force=True if it holds rows from other parameters", metrics_path.name)
+        log.warning("%s will be extended although arbor.params is set; use --force if it holds rows from other parameters", metrics_path.name)
 
     # -- command -----------------------------------------------------------------------------------------------
     if not ctx.dry_run:
         out_dir.mkdir(parents=True, exist_ok=True)
         if fingerprint is not None:  # BEFORE the run: rows R appends belong to this split even if the run is interrupted
             _write_source(out_dir, mode, fingerprint, tag)
-    mounts = [ctx.mount(ctx.data_dir, "/data"), ctx.mount(script_dir, R_MOUNT, readonly=True)]
-    args = [f"{R_MOUNT}/{R_SCRIPT}", "--mode", mode]
+    args = ["Rscript", str(script_dir / R_SCRIPT), "--mode", mode]
     if mode == "per_tree":
-        args += ["--trees_dir", ctx.container_path(trees_dir)]
+        args += ["--trees_dir", str(trees_dir)]
     else:
         placeholder = ctx.stage_dir("dfin") / f"<stem>{DFIN_CLOUD_SUFFIX}"
-        args += ["--plot_las", ctx.container_path(plot_cloud or placeholder), "--max_match_dist", str(max_match_dist)]
-    args += ["--tree_map", ctx.container_path(tree_map_path), "--out_csv", ctx.container_path(metrics_path)]
+        args += ["--plot_las", str(plot_cloud or placeholder), "--max_match_dist", str(max_match_dist)]
+    args += ["--tree_map", str(tree_map_path), "--out_csv", str(metrics_path)]
     args += ["--threads", str(threads), "--skip_low_points", "true" if skip_low_points else "false"]
     if trees is not None:
         args += ["--trees", ",".join(str(o) for o in (selected if selected is not None else sorted({int(t) for t in trees})))]
@@ -509,7 +503,6 @@ def run_arbor(
     if params_arg:
         args += ["--params", params_arg]
 
-    require_image(image, dry_run=ctx.dry_run)
     n_run = len(todo) if selected is not None else None
     log.info(
         "arbor %s: %s tree(s) to process%s -> %s", mode, n_run if n_run is not None else "?",
@@ -518,21 +511,19 @@ def run_arbor(
 
     started = time.monotonic()
     try:
-        result = run_container(
-            image,
+        result = run_tool(
+            ENV_ARBOR,
             args,
-            mounts,
-            network="none",  # arbor needs no network; also makes its update check fail fast
-            env={"OMP_NUM_THREADS": str(threads)},
+            extra_env={"OMP_NUM_THREADS": str(threads)},
             timeout_s=timeout_s or None,
             dry_run=ctx.dry_run,
             log_prefix="arbor",
         )
-    except DockerRunError as exc:
+    except ToolError as exc:
         _write_log(log_path, clean_log_lines(exc.output), append=True)
         tail = "\n".join(clean_log_lines(exc.output)[-25:])
         partial = f" Rows already written stay in {ctx.rel(metrics_path)}; rerun with resume=True to continue." if metrics_path.is_file() else ""
-        raise StageError(f"arbor container failed: {str(exc).splitlines()[0]}\n--- last output ---\n{tail}\n{partial}".rstrip()) from exc
+        raise StageError(f"arbor failed: {str(exc).splitlines()[0]}\n--- last output ---\n{tail}\n{partial}".rstrip()) from exc
     seconds = time.monotonic() - started
 
     if ctx.dry_run:

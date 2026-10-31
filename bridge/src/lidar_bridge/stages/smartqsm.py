@@ -1,35 +1,33 @@
-"""Stage 3a (WP6a): run SmartQSM once per tree in the ``lidar-smartqsm`` container and collect DBH / height.
+"""Stage 3a (WP6a): run SmartQSM once per tree in the ``smartqsm`` environment and collect DBH / height.
 
 Contract
 --------
 Reads ``data/out/<run>/split/tree_map.csv`` + ``split/trees/tree_XXXX.laz`` (see :mod:`lidar_bridge.stages.split`) and writes
-into ``data/out/<run>/smartqsm/<config>/`` (``<config>`` = the preset name, so ``-m smartqsm.config=a,b`` never collides)::
+into ``data/out/<run>/smartqsm/<config>/`` (``<config>`` = the preset name, so runs with different presets never collide)::
 
     config.yaml                   the per-run SmartQSM config: preset from third_party/SmartQSM/configs + overrides
     work/tree_0001.laz            copy of the tree cloud (SmartQSM writes its results next to its input)
     work/tree_0001_qsm.mat        SmartQSM result (QSM.treedata = tree parameters); also _branches.ply, _crown_convex.ply,
                                   _active_crown_convex.ply, _skeleton.dxf
-    logs/tree_0001.log            container output of that tree
+    logs/tree_0001.log            SmartQSM output of that tree
     metrics.csv                   one row per tree, REWRITTEN AFTER EVERY TREE (a 3 h run survives an interrupt); the rows of
                                   the selected trees are merged into the rows of earlier runs on the same split (see below)
     source_fingerprint.txt        hash of split/tree_map.csv + the settings the rows were made with (read by ``compare``)
 
-The container is started once per tree, strictly sequentially (SmartQSM uses ~8 worker processes per tree)::
+SmartQSM is started once per tree, strictly sequentially (it uses ~8 worker processes per tree)::
 
-    docker run --rm -i --network none -v <host>/data:/data lidar-smartqsm -t -y \
+    in-env smartqsm smartqsm-run -t -y \
         -c /data/out/<run>/smartqsm/<config>/config.yaml /data/out/<run>/smartqsm/<config>/work/tree_0001.laz
-    (stdin "no\\n": answers the update-check prompt; the check itself is offline-safe with --network none)
+    (stdin "no\\n": answers the update-check prompt; the check itself fails fast with docker run --network none)
 
 SmartQSM's exit code is ALWAYS 0, so success = ``<stem>_qsm.mat`` exists and holds a readable ``QSM.treedata``.
 
 GPU
 ---
-``gpu=True`` runs the same command with ``docker run --gpus all`` in the image ``lidar-smartqsm-gpu`` (CUDA torch + spconv-cu126;
-built by ``run_pipeline.bat --gpu --build-only``; ``image`` still at its default). Only the ``spconv-contraction-*-GPU`` presets
-(``device: cuda``) use the card; every other preset runs on the CPU even in the GPU image (WARNING). A ``-GPU`` preset without
-``gpu=True`` is refused (the container would have no GPU). A tree that does not fit into the card's memory ends like any other
-SmartQSM failure: no ``.mat``, status ``failed``, the reason (CUDA out of memory, ...) in ``note`` and in ``logs/``; every tree has
-its own container (the memory is freed) and the next trees still run.
+Only the ``spconv-contraction-*-GPU`` presets (``device: cuda``, the default is one of them) use the card, which the container
+gets from ``docker run --gpus all``; every other preset runs on the CPU. A tree that does not fit into the card's memory ends like
+any other SmartQSM failure: no ``.mat``, status ``failed``, the reason (CUDA out of memory, ...) in ``note`` and in ``logs/``; every
+tree is a separate process (the memory is freed) and the next trees still run.
 
 metrics.csv (columns in this order; WP7 ``compare`` reads the first five by name)
 ----------------------------------------------------------------------------------
@@ -45,11 +43,11 @@ num_branches, max_order, stem_volume_m3, trunk_volume_m3, n_points, note``.
 * ``stem_volume_m3`` = ``treedata.stem_volume_L / 1000``: SmartQSM's "stem" is ALL woody parts (trunk + every branch);
   ``trunk_volume_m3`` = ``trunk_volume_L / 1000`` is the main trunk alone.
 * ``status``: ``ok`` | ``no_dbh`` (``DBH_cm == 0``: the trunk does not reach 1.3 m above the lowest point) | ``failed``
-  (no usable ``_qsm.mat`` although the container ran) | ``timeout`` | ``skipped_low_points`` (flagged in tree_map.csv;
-  no cloud was written) | ``error`` (unreadable .mat, missing cloud, docker problem, ...) | ``suspect`` (the model is not
+  (no usable ``_qsm.mat`` although SmartQSM ran) | ``timeout`` | ``skipped_low_points`` (flagged in tree_map.csv;
+  no cloud was written) | ``error`` (unreadable .mat, missing cloud, SmartQSM could not start, ...) | ``suspect`` (the model is not
   plausible for this tree: woody volume more than ``IMPLAUSIBLE_VOLUME_RATIO`` times a DBH x height cylinder; its DBH and height
   are withheld). ``note`` explains non-ok rows.
-* ``seconds``: wall time of the container run (a reused result keeps the value of the previous metrics.csv, else empty).
+* ``seconds``: wall time of the SmartQSM run (a reused result keeps the value of the previous metrics.csv, else empty).
 
 Resume
 ------
@@ -62,7 +60,7 @@ so that an old .mat can never be mistaken for the result of a failed run.
 
 metrics.csv merge
 -----------------
-``metrics.csv`` always describes the whole split, not only the last selection: ``smartqsm.trees=[5]`` replaces the row of tree 5 and
+``metrics.csv`` always describes the whole split, not only the last selection: ``--trees 5`` replaces the row of tree 5 and
 keeps every other row of the earlier runs (output sorted by ordinal, still written atomically after every tree). This is only
 done when ``source_fingerprint.txt`` next to it equals the current one, i.e. the rows were made on the current ``tree_map.csv``
 with the same ``config.yaml`` (and ``skip_low_points``): ``<hash of tree_map.csv>`` / ``config=<hash of config.yaml>
@@ -91,26 +89,23 @@ from typing import Any
 
 import yaml
 
-from lidar_bridge.docker_runner import DockerRunError, image_exists, require_image, run_container
 from lidar_bridge.paths import RunContext
 from lidar_bridge.qsm_mat import QsmMatError, read_treedata
+from lidar_bridge.runner import ENV_SMARTQSM, ToolError, run_tool
 from lidar_bridge.stages._common import StageError, read_fingerprint, tree_map_fingerprint, write_fingerprint
 
 log = logging.getLogger("lidar_bridge.stages.smartqsm")
 
-#: SmartQSM presets (and the source of the baked-in copies in the image), relative to the project directory.
+#: SmartQSM presets, relative to the install directory.
 CONFIGS_DIR = Path("third_party/SmartQSM/configs")
-#: The CPU image (the default of ``image``) and the CUDA image that ``gpu=True`` selects while ``image`` is still the default.
-DEFAULT_IMAGE = "lidar-smartqsm"
-GPU_IMAGE = "lidar-smartqsm-gpu"
-#: The GPU image is not part of a plain ``docker compose build`` (several GB), so a missing one needs this hint.
-GPU_BUILD_HINT = "run_pipeline.bat --gpu --build-only   (or: docker compose --profile gpu build smartqsm-gpu)"
+#: The best match to 3DFin and arbor measured so far, and the spconv option that is repeatable (see the README).
+DEFAULT_CONFIG = "spconv-contraction-LEAFOFF-GPU"
 #: Suffix of the presets whose ``skeletonization.core_algorithm_kwargs.device`` is ``cuda``.
 GPU_PRESET_SUFFIX = "-GPU"
 #: SmartQSM measures DBH this far above the LOWEST point of the cloud.
 BREAST_HEIGHT_M = 1.3
 MAT_SUFFIX = "_qsm.mat"
-#: Answer to the "check for updates?" prompt (belt and braces: --network none already makes the check fail fast).
+#: Answer to the "check for updates?" prompt (belt and braces: docker run --network none already makes the check fail fast).
 STDIN_ANSWER = "no\n"
 
 OK, NO_DBH, FAILED, TIMEOUT, SKIPPED, ERROR = "ok", "no_dbh", "failed", "timeout", "skipped_low_points", "error"
@@ -546,58 +541,17 @@ def uses_cuda(name: str, config: Mapping[str, Any] | None) -> bool:
     return name.endswith(GPU_PRESET_SUFFIX)
 
 
-def check_gpu_setup(name: str, config: Mapping[str, Any] | None, gpu: bool) -> None:
-    """Refuse a GPU preset without ``gpu=True``; warn when ``gpu=True`` is combined with a preset that cannot use CUDA."""
-    cuda = uses_cuda(name, config)
-    if cuda and not gpu:
-        raise StageError(
-            f"smartqsm.config {name!r} runs on the GPU (device: cuda) but smartqsm.gpu is false, so the container would get no "
-            "GPU and SmartQSM would fail. Set smartqsm.gpu=true (run_pipeline.bat --gpu), or use a CPU preset such as "
-            "spconv-contraction-LEAFON-cpu."
-        )
-    if gpu and not cuda:
-        log.warning(
-            "smartqsm.gpu=true, but the preset %r does not use CUDA, so SmartQSM will run on the CPU (the GPU is only used by "
-            "the spconv-contraction-*-GPU presets, e.g. smartqsm.config=spconv-contraction-LEAFOFF-GPU)",
-            name,
-        )
-
-
-def check_image(image: str, *, dry_run: bool) -> None:
-    """The image must exist; the GPU image gets a pointer to the command that builds it (it is not in a plain build)."""
-    if image != GPU_IMAGE:
-        require_image(image, dry_run=dry_run)
-        return
-    try:
-        found = image_exists(image)
-    except DockerRunError as exc:
-        if not dry_run:
-            raise
-        log.warning("[dry-run] cannot check for image %r: %s", image, exc)
-        return
-    if found:
-        return
-    message = f"docker image {image!r} not found. The GPU image is built on request only (several GB): {GPU_BUILD_HINT}"
-    if dry_run:
-        log.warning("[dry-run] %s", message)
-        return
-    raise StageError(message)
-
-
-#: (pattern in the container output, short explanation for the ``note`` column), most specific first.
+#: (pattern in the SmartQSM output, short explanation for the ``note`` column), most specific first.
 _GPU_DIAGNOSES = (
     (re.compile(r"out of memory", re.I), "CUDA out of memory: the tree does not fit into the GPU's free VRAM (try a smaller "
      "skeletonization.core_algorithm_kwargs.batch_size or a -cpu preset)"),
-    (re.compile(r"could not select device driver|nvidia-container-cli|unknown or invalid runtime name: nvidia", re.I),
-     "Docker cannot give the container a GPU (--gpus all failed): needs an NVIDIA driver and Docker Desktop WSL2 GPU support, "
-     "check `docker run --rm --gpus all lidar-bridge nvidia-smi`"),
     (re.compile(r"no kernel image is available|CUDA error|CUDA driver|libcuda|cudaErrorNoDevice|No CUDA GPUs", re.I),
-     "CUDA is not usable in the container (see the log for the CUDA error)"),
+     "CUDA is not usable in the container, was it started with --gpus all? (see the log for the CUDA error)"),
 )  # fmt: skip
 
 
 def diagnose_gpu_failure(output: str) -> str:
-    """One-line reason for a failed GPU run recognised in the container output (``""`` if nothing is recognised)."""
+    """One-line reason for a failed GPU run recognised in the SmartQSM output (``""`` if nothing is recognised)."""
     for pattern, text in _GPU_DIAGNOSES:
         if pattern.search(output or ""):
             return text
@@ -610,7 +564,6 @@ def diagnose_gpu_failure(output: str) -> str:
 @dataclass
 class _Env:
     ctx: RunContext
-    image: str
     gpu: bool
     timeout_s: int
     split_dir: Path
@@ -621,9 +574,8 @@ class _Env:
     skip_low_points: bool
     previous_seconds: dict[int, float]
 
-    def command(self, laz: Path) -> tuple[list[str], list]:
-        args = ["-t", "-y", "-c", self.ctx.container_path(self.config_path), self.ctx.container_path(laz)]
-        return args, [self.ctx.mount(self.ctx.data_dir, "/data")]
+    def command(self, laz: Path) -> list[str]:
+        return ["smartqsm-run", "-t", "-y", "-c", str(self.config_path), str(laz)]
 
 
 def _clean_outputs(work_dir: Path, stem: str) -> None:
@@ -639,7 +591,7 @@ def _write_log(env: _Env, stem: str, output: str) -> None:
         logs.mkdir(exist_ok=True)
         (logs / f"{stem}.log").write_text(output or "", encoding="utf-8")
     except OSError as exc:  # a missing log must never fail the tree
-        log.warning("cannot write the container log of %s: %s", stem, exc)
+        log.warning("cannot write the SmartQSM log of %s: %s", stem, exc)
 
 
 def _reuse_existing(env: _Env, tree: Tree, src: Path, dst: Path, mat: Path) -> TreeResult | None:
@@ -658,7 +610,7 @@ def _reuse_existing(env: _Env, tree: Tree, src: Path, dst: Path, mat: Path) -> T
 
 
 def _process_tree(env: _Env, tree: Tree) -> tuple[TreeResult, bool]:
-    """One tree: reuse / run the container / collect; ``ran`` is True if the container was started.
+    """One tree: reuse / run SmartQSM / collect; ``ran`` is True if SmartQSM was started.
 
     Never raises for tree-level problems (they become status ``error``).
     """
@@ -683,17 +635,13 @@ def _process_tree(env: _Env, tree: Tree) -> tuple[TreeResult, bool]:
     _clean_outputs(env.work_dir, dst.stem)  # a stale .mat must not be mistaken for the result of this run
     if not (dst.is_file() and filecmp.cmp(src, dst, shallow=False)):
         shutil.copyfile(src, dst)
-    args, mounts = env.command(dst)
+    args = env.command(dst)
 
     base = dict(ordinal=tree.ordinal, base_z0_m=tree.base_z0_m, n_points=tree.n_points)
     started = time.monotonic()
     try:
-        proc = run_container(
-            env.image, args, mounts,
-            network="none", stdin=STDIN_ANSWER, gpus=env.gpu, timeout_s=env.timeout_s or None,
-            log_prefix="smartqsm", check=False,
-        )  # fmt: skip
-    except DockerRunError as exc:
+        proc = run_tool(ENV_SMARTQSM, args, stdin=STDIN_ANSWER, timeout_s=env.timeout_s or None, log_prefix="smartqsm", check=False)
+    except ToolError as exc:
         seconds = time.monotonic() - started
         _write_log(env, dst.stem, exc.output)
         timed_out = "timed out" in str(exc)
@@ -706,7 +654,7 @@ def _process_tree(env: _Env, tree: Tree) -> tuple[TreeResult, bool]:
     output = proc.stdout or ""
     _write_log(env, dst.stem, output)
 
-    exit_note = f"container exit code {proc.returncode}" if proc.returncode else ""
+    exit_note = f"exit code {proc.returncode}" if proc.returncode else ""
     if not mat.is_file() or mat.stat().st_size == 0:
         reason = diagnose_gpu_failure(output) if env.gpu else ""
         return TreeResult(
@@ -730,7 +678,7 @@ def _prepare_out_dir(out_dir: Path, work_dir: Path, config_text: str, force: boo
             if not force:
                 raise StageError(
                     f"{config_path} differs from the config the results in {work_dir} were made with, so they must not be "
-                    "reused. Use force=true to discard them (smartqsm.force=true), or another smartqsm.config / run_name."
+                    "reused. Use --force to discard them, or another --smartqsm-config or --run name."
                 )
             log.warning("force: the config changed, discarding the old results in %s", work_dir)
             shutil.rmtree(work_dir)
@@ -742,10 +690,8 @@ def _prepare_out_dir(out_dir: Path, work_dir: Path, config_text: str, force: boo
 def run_smartqsm(
     ctx: RunContext,
     *,
-    config: str = "layerwise-clustering",
-    overrides: dict = {},  # noqa: B006  (never mutated; hydra-zen turns it into a config field)
-    image: str = DEFAULT_IMAGE,
-    gpu: bool = False,
+    config: str = DEFAULT_CONFIG,
+    overrides: dict | None = None,
     timeout_s: int = 1800,
     trees: list[int] | None = None,
     limit: int | None = None,
@@ -753,26 +699,20 @@ def run_smartqsm(
     resume: bool = True,
     force: bool = False,
 ) -> dict:
-    """Run SmartQSM (image ``lidar-smartqsm``, or ``lidar-smartqsm-gpu`` with ``gpu``) on every tree of ``split/`` and write
+    """Run SmartQSM on every tree of ``split/`` and write
     ``smartqsm/<config>/metrics.csv``.
 
     Parameters
     ----------
     config
-        Name of a preset in ``third_party/SmartQSM/configs`` (``layerwise-clustering`` ~85 s per tree, ``space-colonization``,
-        ``spconv-contraction-LEAFOFF-cpu`` ...). Sweepable (``-m smartqsm.config=a,b``); output goes to ``smartqsm/<config>/``.
-        The ``spconv-contraction-*-GPU`` presets need ``gpu=True`` (refused otherwise).
+        Name of a preset in ``third_party/SmartQSM/configs`` (``spconv-contraction-LEAFOFF-GPU``, ``space-colonization``,
+        ``layerwise-clustering`` ...); output goes to ``smartqsm/<config>/``. The ``spconv-contraction-*-GPU`` presets need
+        ``docker run --gpus all``; the command line checks that before the first stage starts.
     overrides
         Changes to the preset: top-level YAML keys (``voxel_down_size``, ``filter``, ``kwargs_for_filter``, ``skeletonization``,
         ``refinement``, ``modeling``) REPLACE the preset's value (shallow ``dict.update``); a dotted key such as
-        ``skeletonization.core_algorithm_kwargs.max_patch_size`` changes a single nested value. CLI:
-        ``+smartqsm.overrides.voxel_down_size=0.02``. Different overrides need a different ``run_name`` (or ``force``).
-    image
-        Docker image tag. While it is left at the default ``lidar-smartqsm``, ``gpu=True`` uses ``lidar-smartqsm-gpu`` instead.
-    gpu
-        Run with ``--gpus all`` in the CUDA image (build it with ``run_pipeline.bat --gpu --build-only``; a missing image is a
-        :class:`StageError` that says so). Only the ``spconv-contraction-*-GPU`` presets use the card; with another preset a
-        warning says that SmartQSM runs on the CPU.
+        ``skeletonization.core_algorithm_kwargs.max_patch_size`` changes a single nested value. Set it in the ``--params`` file.
+        Different overrides need a different run name (or ``force``).
     timeout_s
         Per tree, seconds (0 = no limit); a tree over the limit gets status ``timeout``.
     trees
@@ -794,13 +734,10 @@ def run_smartqsm(
     started = time.monotonic()
     log.info(
         "smartqsm stage parameters: %s",
-        dict(config=config, overrides=overrides, image=image, gpu=gpu, timeout_s=timeout_s, trees=trees, limit=limit,
+        dict(config=config, overrides=overrides, timeout_s=timeout_s, trees=trees, limit=limit,
              skip_low_points=skip_low_points, resume=resume, force=force),
     )  # fmt: skip
     name = check_config_name(config)
-    if gpu and image == DEFAULT_IMAGE:
-        image = GPU_IMAGE
-        log.info("smartqsm.gpu=true: using the image %r with --gpus all", image)
     split_dir = ctx.stage_dir("split")
     out_dir = ctx.stage_dir("smartqsm") / name
     work_dir = out_dir / "work"
@@ -810,7 +747,7 @@ def run_smartqsm(
     # -- per-run config.yaml -----------------------------------------------------------------------------------
     config_text: str | None
     try:
-        base, base_text, known = load_preset(ctx.project_dir / CONFIGS_DIR, name)
+        base, base_text, known = load_preset(ctx.install_dir / CONFIGS_DIR, name)
         merged, changes = merge_overrides(base, overrides, known)
         config_text = render_config(base_text, merged, changed=bool(overrides))
         log.info(
@@ -823,7 +760,7 @@ def run_smartqsm(
         log.warning("[dry-run] %s", exc)
         config_text = None
         merged = None
-    check_gpu_setup(name, merged, gpu)  # also in a dry run: a wrong gpu/preset pair would fail the real run immediately
+    gpu = uses_cuda(name, merged)
 
     # -- trees ---------------------------------------------------------------------------------------------------
     if tree_map.is_file():
@@ -833,16 +770,14 @@ def run_smartqsm(
         placeholders = sorted({int(o) for o in trees}) if trees else [1]  # explicit selections stay valid in a rehearsal
         all_trees = [Tree(ordinal=o, file=f"trees/tree_{o:04d}.laz") for o in placeholders]
     else:
-        raise StageError(f"{tree_map} not found: run the split stage first (stages=[dfin,split,smartqsm])")
+        raise StageError(f"{tree_map} not found: run the split stage first (--stages dfin,split,smartqsm)")
     selected = select_trees(all_trees, trees=trees, limit=limit, skip_low_points=skip_low_points)
     if not selected:
         raise StageError(f"no trees to process ({len(all_trees)} in {tree_map.name})")
 
-    check_image(image, dry_run=ctx.dry_run)
-
     rerun_all = force or not resume
     config_path = out_dir / "config.yaml"
-    env = _Env(ctx, image, gpu, timeout_s, split_dir, out_dir, work_dir, config_path, rerun_all, skip_low_points, {})
+    env = _Env(ctx, gpu, timeout_s, split_dir, out_dir, work_dir, config_path, rerun_all, skip_low_points, {})
 
     # -- dry run: log the commands, touch nothing -----------------------------------------------------------------
     if ctx.dry_run:
@@ -851,12 +786,9 @@ def run_smartqsm(
             if skip_low_points and tree.low_points:
                 log.info("[dry-run] tree %d: skipped (low_points)", tree.ordinal)
                 continue
-            args, mounts = env.command(work_dir / Path(tree.file or f"tree_{tree.ordinal:04d}.laz").name)
-            run_container(
-                image, args, mounts,
-                network="none", stdin=STDIN_ANSWER, gpus=gpu, timeout_s=timeout_s or None, dry_run=True,
-            )  # fmt: skip
-        return {"dir": str(ctx.rel(out_dir)), "config": name, "image": image, "gpu": gpu, "n_selected": len(selected), "dry_run": True}
+            args = env.command(work_dir / Path(tree.file or f"tree_{tree.ordinal:04d}.laz").name)
+            run_tool(ENV_SMARTQSM, args, stdin=STDIN_ANSWER, timeout_s=timeout_s or None, dry_run=True)
+        return {"dir": str(ctx.rel(out_dir)), "config": name, "gpu": gpu, "n_selected": len(selected), "dry_run": True}
 
     assert config_text is not None
     env.config_path = _prepare_out_dir(out_dir, work_dir, config_text, force)
@@ -919,7 +851,6 @@ def run_smartqsm(
     return {
         "dir": str(ctx.rel(out_dir)),
         "config": name,
-        "image": image,
         "gpu": gpu,
         "config_file": str(ctx.rel(env.config_path)),
         "metrics": str(ctx.rel(metrics_path)),

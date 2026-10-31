@@ -130,7 +130,7 @@ class DfinFiles:
     @classmethod
     def find(cls, dfin_dir: Path, input_path: Path | None) -> DfinFiles:
         if not dfin_dir.is_dir():
-            raise StageError(f"no 3DFin results in {dfin_dir}: run the dfin stage first (stages=[dfin,split])")
+            raise StageError(f"no 3DFin results in {dfin_dir}: run the dfin stage first (--stages dfin,split)")
         suffix = "_tree_ID_dist_axes.las"
         stem = None
         if input_path is not None and (dfin_dir / f"{input_path.stem}{suffix}").is_file():

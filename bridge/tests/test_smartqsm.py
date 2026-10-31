@@ -6,19 +6,18 @@ import math
 import re
 import subprocess
 from dataclasses import replace
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 import pytest
 import yaml
 from scipy.io import savemat
 
-from lidar_bridge import docker_runner
-from lidar_bridge.docker_runner import DockerRunError, ImageNotFoundError, Mount
+from lidar_bridge import runner
 from lidar_bridge.paths import RunContext
+from lidar_bridge.runner import ToolError
 from lidar_bridge.stages import smartqsm
 from lidar_bridge.stages._common import FINGERPRINT_FILE, StageError, read_fingerprint, tree_map_fingerprint
 
-HOST = "D:/Podyplomowe/05_Proximity_Lidar"
 LC = "layerwise-clustering"
 SC = "space-colonization"
 GPU_PRESET = "spconv-contraction-LEAFON-GPU"
@@ -114,47 +113,51 @@ def write_mat(path: Path, dbh_cm: float = 20.0, height_m: float = 11.0, **extra)
     savemat(path, {"QSM": {"cylinder": {"n": 1.0}, "treedata": treedata, "rundata": {"start": 0}}})
 
 
+def run_smartqsm(ctx: RunContext, **kw) -> dict:
+    """``smartqsm.run_smartqsm`` with the layerwise-clustering preset as default: the default of the stage is a GPU preset."""
+    kw.setdefault("config", LC)
+    return smartqsm.run_smartqsm(ctx, **kw)
+
+
 class FakeSmartQsm:
-    """Replaces ``run_container`` in the stage module. ``behaviour[ordinal]`` = dict(mode=..., dbh_cm=..., height_m=..., rc=...)."""
+    """Replaces ``run_tool`` in the stage module. ``behaviour[ordinal]`` = dict(mode=..., dbh_cm=..., height_m=..., rc=...)."""
 
     def __init__(self, ctx: RunContext, behaviour: dict[int, dict] | None = None):
         self.ctx = ctx
         self.behaviour = behaviour or {}
         self.calls: list[dict] = []
-        self.hook = None  # called as hook(ordinal, laz_path) before the "container" produces anything
+        self.hook = None  # called as hook(ordinal, laz_path) before the "tool" produces anything
 
     @property
     def ordinals(self) -> list[int]:
         return [c["ordinal"] for c in self.calls]
 
-    def __call__(self, image, args, mounts=(), **kw):
-        laz = self.ctx.data_dir / PurePosixPath(args[-1]).relative_to("/data")
+    def __call__(self, env, args, **kw):
+        laz = Path(args[-1])
         ordinal = int(laz.stem.split("_")[1])
-        self.calls.append(dict(image=image, args=list(args), mounts=list(mounts), ordinal=ordinal, laz=laz, **kw))
+        self.calls.append(dict(env=env, args=list(args), ordinal=ordinal, laz=laz, **kw))
         if self.hook:
             self.hook(ordinal, laz)
         spec = {"mode": "ok", **self.behaviour.get(ordinal, {})}
         mat = laz.with_name(f"{laz.stem}_qsm.mat")
         mode = spec["mode"]
         if mode == "timeout":
-            raise DockerRunError(
-                f"container 'smartqsm' timed out after {kw.get('timeout_s')} s and was killed", returncode=137, output="partial output"
+            raise ToolError(
+                f"smartqsm timed out after {kw.get('timeout_s')} s and was killed", returncode=-9, output="partial output"
             )
-        if mode == "docker_down":
-            raise DockerRunError("the `docker` CLI is not installed in this container")
+        if mode == "cannot_start":
+            raise ToolError("cannot start smartqsm: [Errno 2] No such file or directory: 'in-env'")
         if mode == "ok":
             write_mat(mat, spec.get("dbh_cm", 20.0), spec.get("height_m", 10.0 + ordinal))
         elif mode == "corrupt":
             mat.write_bytes(b"\x00garbage" * 10)
-        return subprocess.CompletedProcess(["docker"], spec.get("rc", 0), stdout=spec.get("out", "Initialized point cloud.\nDone.\nFinished."), stderr=None)
+        return subprocess.CompletedProcess(["in-env"], spec.get("rc", 0), stdout=spec.get("out", "Initialized point cloud.\nDone.\nFinished."), stderr=None)
 
 
 @pytest.fixture
 def fake(monkeypatch, sq) -> FakeSmartQsm:
     f = FakeSmartQsm(sq)
-    monkeypatch.setattr(smartqsm, "run_container", f)
-    monkeypatch.setattr(smartqsm, "require_image", lambda *a, **k: None)
-    monkeypatch.setattr(smartqsm, "image_exists", lambda *a, **k: True)  # the GPU image is checked with this one
+    monkeypatch.setattr(smartqsm, "run_tool", f)
     return f
 
 
@@ -182,13 +185,13 @@ def by_ordinal(rows: list[dict[str, str]]) -> dict[int, dict[str, str]]:
 # ---------------------------------------------------------------------------------------------------------
 def test_preset_without_overrides_is_copied_verbatim(sq, fake):
     make_split(sq, 1)
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     assert (sq.stage_dir("smartqsm") / LC / "config.yaml").read_text() == PRESET_LC
 
 
 def test_shallow_override_replaces_top_level_values(sq, fake):
     make_split(sq, 1)
-    smartqsm.run_smartqsm(sq, overrides={"voxel_down_size": 0.03, "kwargs_for_filter": {"nb_neighbors": 20, "std_ratio": 2.0}})
+    run_smartqsm(sq, overrides={"voxel_down_size": 0.03, "kwargs_for_filter": {"nb_neighbors": 20, "std_ratio": 2.0}})
     written = yaml.safe_load((sq.stage_dir("smartqsm") / LC / "config.yaml").read_text())
     base = yaml.safe_load(PRESET_LC)
     assert written["voxel_down_size"] == 0.03
@@ -202,7 +205,7 @@ def test_shallow_override_replaces_top_level_values(sq, fake):
 def test_overriding_a_block_replaces_it_and_warns_about_lost_keys(sq, fake, caplog):
     make_split(sq, 1)
     with caplog.at_level(logging.WARNING, logger="lidar_bridge.stages.smartqsm"):
-        smartqsm.run_smartqsm(sq, overrides={"skeletonization": {"category": "thinning"}})
+        run_smartqsm(sq, overrides={"skeletonization": {"category": "thinning"}})
     written = yaml.safe_load((sq.stage_dir("smartqsm") / LC / "config.yaml").read_text())
     assert written["skeletonization"] == {"category": "thinning"}  # SHALLOW: the preset's other keys are gone
     assert "REPLACES" in caplog.text and "skeletonization.core_algorithm_kwargs" in caplog.text
@@ -210,7 +213,7 @@ def test_overriding_a_block_replaces_it_and_warns_about_lost_keys(sq, fake, capl
 
 def test_dotted_override_changes_one_nested_value(sq, fake):
     make_split(sq, 1)
-    smartqsm.run_smartqsm(sq, overrides={"skeletonization.core_algorithm_kwargs.max_patch_size": 0.06})
+    run_smartqsm(sq, overrides={"skeletonization.core_algorithm_kwargs.max_patch_size": 0.06})
     written = yaml.safe_load((sq.stage_dir("smartqsm") / LC / "config.yaml").read_text())
     assert written["skeletonization"]["core_algorithm_kwargs"] == {"max_patch_size": 0.06, "neighborhood_size": 0.055}
     assert written["skeletonization"]["category"] == "segmentation"
@@ -219,7 +222,7 @@ def test_dotted_override_changes_one_nested_value(sq, fake):
 def test_overrides_are_logged(sq, fake, caplog):
     make_split(sq, 1)
     with caplog.at_level(logging.INFO, logger="lidar_bridge.stages.smartqsm"):
-        smartqsm.run_smartqsm(sq, overrides={"voxel_down_size": 0.03})
+        run_smartqsm(sq, overrides={"voxel_down_size": 0.03})
     assert "voxel_down_size: 0.01 -> 0.03" in caplog.text
 
 
@@ -235,13 +238,13 @@ def test_overrides_are_logged(sq, fake, caplog):
 def test_bad_override_keys_are_rejected(sq, fake, overrides, message):
     make_split(sq, 1)
     with pytest.raises(StageError, match=message):
-        smartqsm.run_smartqsm(sq, overrides=overrides)
+        run_smartqsm(sq, overrides=overrides)
     assert not fake.calls
 
 
 def test_key_known_from_another_preset_is_allowed(sq, fake):
     make_split(sq, 1)
-    smartqsm.run_smartqsm(sq, overrides={"using_density_adaptation_in_skeletonization": False})  # only SC has it
+    run_smartqsm(sq, overrides={"using_density_adaptation_in_skeletonization": False})  # only SC has it
     written = yaml.safe_load((sq.stage_dir("smartqsm") / LC / "config.yaml").read_text())
     assert written["using_density_adaptation_in_skeletonization"] is False
 
@@ -249,32 +252,32 @@ def test_key_known_from_another_preset_is_allowed(sq, fake):
 def test_unknown_preset_lists_the_available_ones(sq, fake):
     make_split(sq, 1)
     with pytest.raises(StageError, match=r"unknown SmartQSM config 'nope'.*layerwise-clustering.*space-colonization"):
-        smartqsm.run_smartqsm(sq, config="nope")
+        run_smartqsm(sq, config="nope")
 
 
 def test_missing_submodule_is_a_clear_error(ctx, monkeypatch):
-    monkeypatch.setattr(smartqsm, "run_container", FakeSmartQsm(ctx))
+    monkeypatch.setattr(smartqsm, "run_tool", FakeSmartQsm(ctx))
     make_split(ctx, 1)
     with pytest.raises(StageError, match="submodule"):
-        smartqsm.run_smartqsm(ctx)
+        run_smartqsm(ctx)
 
 
 @pytest.mark.parametrize("bad", ["../x", "a/b", "with space", "", "..", ".hidden"])
 def test_config_name_is_validated_because_it_becomes_a_directory(sq, fake, bad):
     make_split(sq, 1)
     with pytest.raises(StageError, match="invalid smartqsm.config"):
-        smartqsm.run_smartqsm(sq, config=bad)
+        run_smartqsm(sq, config=bad)
 
 
 def test_yaml_suffix_in_config_name_is_tolerated(sq, fake):
     make_split(sq, 1)
-    assert smartqsm.run_smartqsm(sq, config=f"{SC}.yaml")["config"] == SC
+    assert run_smartqsm(sq, config=f"{SC}.yaml")["config"] == SC
 
 
 def test_sweep_over_presets_uses_separate_directories(sq, fake):
     make_split(sq, 2)
-    smartqsm.run_smartqsm(sq, config=LC)
-    smartqsm.run_smartqsm(sq, config=SC, overrides={"voxel_down_size": 0.05})
+    run_smartqsm(sq, config=LC)
+    run_smartqsm(sq, config=SC, overrides={"voxel_down_size": 0.05})
     base = sq.stage_dir("smartqsm")
     assert sorted(p.name for p in base.iterdir()) == [LC, SC]
     for name in (LC, SC):
@@ -282,195 +285,99 @@ def test_sweep_over_presets_uses_separate_directories(sq, fake):
         assert len(metrics(sq, name)) == 2
     assert yaml.safe_load((base / SC / "config.yaml").read_text())["voxel_down_size"] == 0.05
     assert yaml.safe_load((base / LC / "config.yaml").read_text())["voxel_down_size"] == 0.01
-    # each run pointed the container at its own config and work dir
+    # each run pointed the tool at its own config and work dir
     lc_call = next(c for c in fake.calls if f"/{LC}/" in c["args"][-1])
     sc_call = next(c for c in fake.calls if f"/{SC}/" in c["args"][-1])
-    assert lc_call["args"][3] == f"/data/out/r1/smartqsm/{LC}/config.yaml"
-    assert sc_call["args"][3] == f"/data/out/r1/smartqsm/{SC}/config.yaml"
+    assert lc_call["args"][4] == str(base / LC / "config.yaml")
+    assert sc_call["args"][4] == str(base / SC / "config.yaml")
 
 
 # ---------------------------------------------------------------------------------------------------------
-# container command
+# tool command
 # ---------------------------------------------------------------------------------------------------------
-def test_container_command_is_the_documented_contract(sq, fake):
+def test_tool_command_is_the_documented_contract(sq, fake):
     make_split(sq, 1)
-    smartqsm.run_smartqsm(sq, timeout_s=77)
+    run_smartqsm(sq, timeout_s=77)
     (call,) = fake.calls
-    assert call["image"] == "lidar-smartqsm"
-    assert call["args"] == [
-        "-t", "-y", "-c", f"/data/out/r1/smartqsm/{LC}/config.yaml", f"/data/out/r1/smartqsm/{LC}/work/tree_0001.laz",
-    ]  # fmt: skip
-    assert call["mounts"] == [Mount(f"{HOST}/data", "/data")]
-    assert call["network"] == "none" and call["stdin"] == "no\n" and call["gpus"] is False
+    out = sq.stage_dir("smartqsm") / LC
+    assert call["env"] == "smartqsm"
+    assert call["args"] == ["smartqsm-run", "-t", "-y", "-c", str(out / "config.yaml"), str(out / "work" / "tree_0001.laz")]
+    assert call["stdin"] == "no\n"
     assert call["timeout_s"] == 77 and call["check"] is False
 
 
-def test_real_run_container_argv_and_stdin(sq, monkeypatch):
-    """Through the real run_container: only the process launcher is replaced."""
+def test_real_run_tool_argv_and_stdin(sq, monkeypatch):
+    """Through the real run_tool: only the process launcher is replaced."""
     make_split(sq, 1)
-    monkeypatch.setattr(smartqsm, "require_image", lambda *a, **k: None)
     seen = {}
 
-    def fake_execute(cmd, *, stdin, timeout_s, name, prefix):
-        seen.update(cmd=cmd, stdin=stdin, timeout_s=timeout_s, name=name)
+    def fake_execute(cmd, *, stdin, extra_env, timeout_s, prefix):
+        seen.update(cmd=cmd, stdin=stdin, timeout_s=timeout_s, extra_env=extra_env)
         write_mat(sq.stage_dir("smartqsm") / LC / "work" / "tree_0001_qsm.mat")
         return subprocess.CompletedProcess(cmd, 0, stdout="Done.", stderr=None)
 
-    monkeypatch.setattr(docker_runner, "_execute", fake_execute)
-    smartqsm.run_smartqsm(sq, timeout_s=90)
-    cmd = seen["cmd"]
+    monkeypatch.setattr(runner, "_execute", fake_execute)
+    run_smartqsm(sq, timeout_s=90)
+    out = sq.stage_dir("smartqsm") / LC
     assert seen["stdin"] == "no\n"
-    assert cmd[:4] == ["docker", "run", "--rm", "-i"]  # -i, otherwise docker drops the stdin answer
-    assert cmd[cmd.index("--network") + 1] == "none"
-    assert "--gpus" not in cmd
-    assert f"type=bind,source={HOST}/data,target=/data" in cmd
-    assert cmd[cmd.index("lidar-smartqsm") + 1 :] == [
-        "-t", "-y", "-c", f"/data/out/r1/smartqsm/{LC}/config.yaml", f"/data/out/r1/smartqsm/{LC}/work/tree_0001.laz",
+    assert seen["cmd"] == [
+        "in-env", "smartqsm", "smartqsm-run", "-t", "-y", "-c", str(out / "config.yaml"), str(out / "work" / "tree_0001.laz"),
     ]  # fmt: skip
-    assert seen["timeout_s"] == 90 and seen["name"].startswith("lidar-")  # named, so a timeout can docker-kill it
-
-
-def test_real_run_container_argv_with_gpu(sqg, monkeypatch):
-    """gpu=True through the real run_container: the GPU image, ``--gpus all`` before the mounts and the image."""
-    make_split(sqg, 1)
-    monkeypatch.setattr(smartqsm, "image_exists", lambda *a, **k: True)
-    seen = {}
-
-    def fake_execute(cmd, *, stdin, timeout_s, name, prefix):
-        seen.update(cmd=cmd, stdin=stdin)
-        write_mat(sqg.stage_dir("smartqsm") / GPU_PRESET / "work" / "tree_0001_qsm.mat")
-        return subprocess.CompletedProcess(cmd, 0, stdout="Done.", stderr=None)
-
-    monkeypatch.setattr(docker_runner, "_execute", fake_execute)
-    smartqsm.run_smartqsm(sqg, config=GPU_PRESET, gpu=True)
-    cmd = seen["cmd"]
-    assert seen["stdin"] == "no\n" and cmd[:4] == ["docker", "run", "--rm", "-i"]
-    assert cmd[cmd.index("--gpus") + 1] == "all" and cmd[cmd.index("--network") + 1] == "none"
-    assert cmd.index("--gpus") < cmd.index("--mount") < cmd.index("lidar-smartqsm-gpu")
-    assert "lidar-smartqsm" not in cmd  # the CPU image is not involved
-    assert cmd[cmd.index("lidar-smartqsm-gpu") + 1 :] == [
-        "-t", "-y", "-c", f"/data/out/r1/smartqsm/{GPU_PRESET}/config.yaml", f"/data/out/r1/smartqsm/{GPU_PRESET}/work/tree_0001.laz",
-    ]  # fmt: skip
-
-
-def test_no_gpu_flag_by_default_and_custom_image(sq, fake):
-    make_split(sq, 1)
-    smartqsm.run_smartqsm(sq, image="lidar-smartqsm:gpu")
-    assert fake.calls[0]["gpus"] is False and fake.calls[0]["image"] == "lidar-smartqsm:gpu"
-    fake.calls.clear()
-    smartqsm.run_smartqsm(sq, gpu=True, force=True)
-    assert fake.calls[0]["gpus"] is True
+    assert seen["timeout_s"] == 90
 
 
 # ---------------------------------------------------------------------------------------------------------
 # GPU
 # ---------------------------------------------------------------------------------------------------------
-def test_gpu_uses_the_gpu_image_and_passes_gpus_all(sqg, fake):
+def test_default_config_is_the_leafoff_gpu_preset(sqg, fake):
+    assert smartqsm.DEFAULT_CONFIG == "spconv-contraction-LEAFOFF-GPU"
+    (sqg.install_dir / smartqsm.CONFIGS_DIR / f"{smartqsm.DEFAULT_CONFIG}.yaml").write_text(
+        PRESET_SPCONV.format(device="cuda"), encoding="utf-8"
+    )
+    make_split(sqg, 1)
+    result = smartqsm.run_smartqsm(sqg)  # no config given
+    assert result["config"] == "spconv-contraction-LEAFOFF-GPU" and result["gpu"] is True
+    assert (sqg.stage_dir("smartqsm") / smartqsm.DEFAULT_CONFIG / "metrics.csv").is_file()
+
+
+def test_a_gpu_preset_is_reported_as_gpu_run(sqg, fake):
     make_split(sqg, 2)
-    result = smartqsm.run_smartqsm(sqg, config=GPU_PRESET, gpu=True)
-    assert [c["image"] for c in fake.calls] == ["lidar-smartqsm-gpu"] * 2
-    assert [c["gpus"] for c in fake.calls] == [True, True]
-    assert fake.calls[0]["args"][:3] == ["-t", "-y", "-c"] and fake.calls[0]["network"] == "none"
-    assert result["image"] == "lidar-smartqsm-gpu" and result["gpu"] is True and result["counts"] == {"ok": 2}
+    result = run_smartqsm(sqg, config=GPU_PRESET)
+    assert [c["env"] for c in fake.calls] == ["smartqsm"] * 2
+    assert fake.calls[0]["args"][:4] == ["smartqsm-run", "-t", "-y", "-c"]
+    assert result["gpu"] is True and result["counts"] == {"ok": 2}
 
 
-def test_without_gpu_the_cpu_image_is_used_and_no_gpus_flag(sqg, fake):
+def test_a_cpu_preset_is_reported_as_cpu_run(sqg, fake):
     make_split(sqg, 1)
-    result = smartqsm.run_smartqsm(sqg, config=CPU_PRESET)
-    assert fake.calls[0]["image"] == "lidar-smartqsm" and fake.calls[0]["gpus"] is False
-    assert result["image"] == "lidar-smartqsm" and result["gpu"] is False
+    result = run_smartqsm(sqg, config=CPU_PRESET)
+    assert fake.calls[0]["env"] == "smartqsm"
+    assert result["gpu"] is False
 
 
-def test_gpu_with_an_explicit_image_keeps_that_image(sqg, fake):
-    make_split(sqg, 1)
-    smartqsm.run_smartqsm(sqg, config=GPU_PRESET, gpu=True, image="my/own-smartqsm:cuda")
-    assert fake.calls[0]["image"] == "my/own-smartqsm:cuda" and fake.calls[0]["gpus"] is True
-
-
-def test_gpu_image_missing_says_how_to_build_it(sqg, fake, monkeypatch):
-    make_split(sqg, 1)
-    monkeypatch.setattr(smartqsm, "image_exists", lambda tag: False)
-    with pytest.raises(StageError) as exc:
-        smartqsm.run_smartqsm(sqg, config=GPU_PRESET, gpu=True)
-    message = str(exc.value)
-    assert "'lidar-smartqsm-gpu' not found" in message and "run_pipeline.bat --gpu --build-only" in message
-    assert "docker compose --profile gpu build smartqsm-gpu" in message
-    assert not fake.calls and not (sqg.stage_dir("smartqsm") / GPU_PRESET / "work").exists()
-
-
-def test_missing_cpu_image_is_still_reported_by_require_image(sqg, fake, monkeypatch):
-    make_split(sqg, 1)
-
-    def no_image(tag, *, dry_run=False):
-        raise ImageNotFoundError(f"docker image {tag!r} not found")
-
-    monkeypatch.setattr(smartqsm, "require_image", no_image)
-    with pytest.raises(ImageNotFoundError, match="'lidar-smartqsm' not found"):
-        smartqsm.run_smartqsm(sqg, config=CPU_PRESET)
-
-
-def test_gpu_image_check_failure_is_not_swallowed(sqg, fake, monkeypatch):
-    make_split(sqg, 1)
-
-    def broken(tag):
-        raise DockerRunError("`docker image inspect` timed out")
-
-    monkeypatch.setattr(smartqsm, "image_exists", broken)
-    with pytest.raises(DockerRunError, match="timed out"):
-        smartqsm.run_smartqsm(sqg, config=GPU_PRESET, gpu=True)
-
-
-def test_gpu_preset_without_gpu_is_refused_with_the_fix(sqg, fake):
-    make_split(sqg, 1)
-    with pytest.raises(StageError) as exc:
-        smartqsm.run_smartqsm(sqg, config=GPU_PRESET)
-    assert "smartqsm.gpu=true" in str(exc.value) and GPU_PRESET in str(exc.value) and "run_pipeline.bat --gpu" in str(exc.value)
-    assert not fake.calls and not (sqg.stage_dir("smartqsm") / GPU_PRESET).exists()  # nothing was started or written
-
-
-def test_a_cuda_device_override_counts_as_a_gpu_preset(sqg, fake, caplog):
+def test_a_cuda_device_override_counts_as_a_gpu_preset(sqg, fake):
     make_split(sqg, 1)
     over = {"skeletonization.core_algorithm_kwargs.device": "cuda"}
-    with pytest.raises(StageError, match="smartqsm.gpu=true"):
-        smartqsm.run_smartqsm(sqg, config=CPU_PRESET, overrides=over)  # a -cpu preset turned into a GPU one
-    smartqsm.run_smartqsm(sqg, config=CPU_PRESET, overrides=over, gpu=True)
-    assert "does not use CUDA" not in caplog.text and fake.calls[0]["gpus"] is True
+    assert run_smartqsm(sqg, config=CPU_PRESET, overrides=over)["gpu"] is True  # a -cpu preset turned into a GPU one
     fake.calls.clear()
-    smartqsm.run_smartqsm(  # and the other way round: a -GPU preset forced onto the CPU needs no GPU
+    result = run_smartqsm(  # and the other way round: a -GPU preset forced onto the CPU
         sqg, config=GPU_PRESET, overrides={"skeletonization.core_algorithm_kwargs.device": "cpu"}, force=True
     )
-    assert fake.calls[0]["gpus"] is False and fake.calls[0]["image"] == "lidar-smartqsm"
+    assert result["gpu"] is False
 
 
-@pytest.mark.parametrize("config", [LC, SC, CPU_PRESET])
-def test_gpu_with_a_cpu_preset_warns_that_it_runs_on_the_cpu(sqg, fake, caplog, config):
+def test_a_gpu_preset_does_not_warn(sqg, fake, caplog):
     make_split(sqg, 1)
     with caplog.at_level(logging.WARNING, logger="lidar_bridge.stages.smartqsm"):
-        smartqsm.run_smartqsm(sqg, config=config, gpu=True)
-    warning = next(r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
-    assert config in warning and "run on the CPU" in warning and "spconv-contraction-LEAFOFF-GPU" in warning
-    assert fake.calls[0]["gpus"] is True  # warned, not refused: the run goes on
-
-
-def test_gpu_with_a_gpu_preset_does_not_warn(sqg, fake, caplog):
-    make_split(sqg, 1)
-    with caplog.at_level(logging.WARNING, logger="lidar_bridge.stages.smartqsm"):
-        smartqsm.run_smartqsm(sqg, config=GPU_PRESET, gpu=True)
+        run_smartqsm(sqg, config=GPU_PRESET)
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
-def test_gpu_checks_also_work_from_the_preset_name_alone(ctx, monkeypatch, caplog):
+def test_gpu_is_derived_from_the_preset_name_alone_in_a_dry_run(ctx):
     """Dry run of the whole pipeline without presets on disk: the preset text is unknown, the name decides."""
     dry = replace(ctx, dry_run=True)
-    monkeypatch.setattr(smartqsm, "require_image", lambda *a, **k: None)
-    monkeypatch.setattr(smartqsm, "image_exists", lambda *a, **k: True)
-    with pytest.raises(StageError, match="smartqsm.gpu=true"):
-        smartqsm.run_smartqsm(dry, config=GPU_PRESET)
-    with caplog.at_level(logging.WARNING, logger="lidar_bridge.stages.smartqsm"):
-        smartqsm.run_smartqsm(dry, config=GPU_PRESET, gpu=True)
-        assert "run on the CPU" not in caplog.text
-        smartqsm.run_smartqsm(dry, config=CPU_PRESET, gpu=True)
-    assert "run on the CPU" in caplog.text
+    assert smartqsm.run_smartqsm(dry, config=GPU_PRESET)["gpu"] is True
+    assert smartqsm.run_smartqsm(dry, config=CPU_PRESET)["gpu"] is False
 
 
 @pytest.mark.parametrize(
@@ -504,11 +411,9 @@ CUDA_OOM = (
 
 def test_cuda_out_of_memory_fails_that_tree_with_the_reason_and_the_others_go_on(sqg, monkeypatch):
     f = FakeSmartQsm(sqg, {2: {"mode": "nomat", "out": CUDA_OOM}})
-    monkeypatch.setattr(smartqsm, "run_container", f)
-    monkeypatch.setattr(smartqsm, "require_image", lambda *a, **k: None)
-    monkeypatch.setattr(smartqsm, "image_exists", lambda *a, **k: True)
+    monkeypatch.setattr(smartqsm, "run_tool", f)
     make_split(sqg, 3)
-    result = smartqsm.run_smartqsm(sqg, config=GPU_PRESET, gpu=True)
+    result = run_smartqsm(sqg, config=GPU_PRESET)
     rows = by_ordinal(metrics(sqg, GPU_PRESET))
     assert [rows[i]["status"] for i in (1, 2, 3)] == ["ok", "failed", "ok"] and f.ordinals == [1, 2, 3]
     assert "CUDA out of memory" in rows[2]["note"] and "batch_size" in rows[2]["note"]
@@ -519,26 +424,11 @@ def test_cuda_out_of_memory_fails_that_tree_with_the_reason_and_the_others_go_on
 
 def test_gpu_diagnosis_is_only_added_for_gpu_runs(sqg, monkeypatch):
     f = FakeSmartQsm(sqg, {1: {"mode": "nomat", "out": CUDA_OOM}})
-    monkeypatch.setattr(smartqsm, "run_container", f)
-    monkeypatch.setattr(smartqsm, "require_image", lambda *a, **k: None)
+    monkeypatch.setattr(smartqsm, "run_tool", f)
     make_split(sqg, 2)
-    smartqsm.run_smartqsm(sqg, config=CPU_PRESET)
+    run_smartqsm(sqg, config=CPU_PRESET)
     row = by_ordinal(metrics(sqg, CPU_PRESET))[1]
     assert row["status"] == "failed" and "batch_size" not in row["note"] and "OutOfMemoryError" in row["note"]
-
-
-def test_docker_without_gpu_support_fails_every_tree_with_the_reason(sqg, monkeypatch):
-    out = 'docker: Error response from daemon: could not select device driver "" with capabilities: [[gpu]]'
-    f = FakeSmartQsm(sqg, {1: {"mode": "nomat", "rc": 125, "out": out}, 2: {"mode": "nomat", "rc": 125, "out": out}})
-    monkeypatch.setattr(smartqsm, "run_container", f)
-    monkeypatch.setattr(smartqsm, "require_image", lambda *a, **k: None)
-    monkeypatch.setattr(smartqsm, "image_exists", lambda *a, **k: True)
-    make_split(sqg, 2)
-    with pytest.raises(StageError, match="no result for any of the 2 tree"):
-        smartqsm.run_smartqsm(sqg, config=GPU_PRESET, gpu=True)
-    row = by_ordinal(metrics(sqg, GPU_PRESET))[1]
-    assert row["status"] == "failed" and "container exit code 125" in row["note"]
-    assert "Docker cannot give the container a GPU" in row["note"] and "nvidia-smi" in row["note"]
 
 
 @pytest.mark.parametrize(
@@ -546,7 +436,6 @@ def test_docker_without_gpu_support_fails_every_tree_with_the_reason(sqg, monkey
     [
         ("torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 20.00 MiB", "CUDA out of memory"),
         ("RuntimeError: CUDA error: out of memory", "CUDA out of memory"),
-        ("nvidia-container-cli: initialization error: driver rpc error", "Docker cannot give the container a GPU"),
         ("RuntimeError: CUDA error: no kernel image is available for execution on the device", "CUDA is not usable"),
         ("ValueError: boom", ""),
         ("", ""),
@@ -559,25 +448,24 @@ def test_diagnose_gpu_failure(output, fragment):
 
 def test_timeout_zero_means_no_limit(sq, fake):
     make_split(sq, 1)
-    smartqsm.run_smartqsm(sq, timeout_s=0)
+    run_smartqsm(sq, timeout_s=0)
     assert fake.calls[0]["timeout_s"] is None
 
 
 def test_tree_cloud_is_copied_to_work_and_original_untouched(sq, fake):
     split = make_split(sq, 1)
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     work = sq.stage_dir("smartqsm") / LC / "work"
     assert (work / "tree_0001.laz").read_bytes() == b"cloud of tree 1"
     assert (split / "trees" / "tree_0001.laz").read_bytes() == b"cloud of tree 1"
     assert sorted(p.name for p in (split / "trees").iterdir()) == ["tree_0001.laz"]  # SmartQSM output went to work/ only
 
 
-def test_container_log_is_saved(sq, monkeypatch):
+def test_tool_log_is_saved(sq, monkeypatch):
     f = FakeSmartQsm(sq, {1: {"out": "line a\nline b"}})
-    monkeypatch.setattr(smartqsm, "run_container", f)
-    monkeypatch.setattr(smartqsm, "require_image", lambda *a, **k: None)
+    monkeypatch.setattr(smartqsm, "run_tool", f)
     make_split(sq, 1)
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     assert (sq.stage_dir("smartqsm") / LC / "logs" / "tree_0001.log").read_text() == "line a\nline b"
 
 
@@ -586,7 +474,7 @@ def test_container_log_is_saved(sq, monkeypatch):
 # ---------------------------------------------------------------------------------------------------------
 def test_trees_selects_ordinals_in_ascending_order(sq, fake):
     make_split(sq, 5)
-    result = smartqsm.run_smartqsm(sq, trees=[4, 2, 4])
+    result = run_smartqsm(sq, trees=[4, 2, 4])
     assert fake.ordinals == [2, 4]
     assert [int(r["ordinal"]) for r in metrics(sq)] == [2, 4]
     assert result["n_selected"] == 2
@@ -595,23 +483,23 @@ def test_trees_selects_ordinals_in_ascending_order(sq, fake):
 def test_unknown_ordinal_is_an_error(sq, fake):
     make_split(sq, 3)
     with pytest.raises(StageError, match=r"ordinal\(s\) \[7\] are not in tree_map.csv"):
-        smartqsm.run_smartqsm(sq, trees=[1, 7])
+        run_smartqsm(sq, trees=[1, 7])
     with pytest.raises(StageError, match="empty"):
-        smartqsm.run_smartqsm(sq, trees=[])
+        run_smartqsm(sq, trees=[])
     assert not fake.calls
 
 
 def test_limit_takes_the_first_n(sq, fake):
     make_split(sq, 5)
-    smartqsm.run_smartqsm(sq, limit=2)
+    run_smartqsm(sq, limit=2)
     assert fake.ordinals == [1, 2]
     with pytest.raises(StageError, match="positive"):
-        smartqsm.run_smartqsm(sq, limit=0)
+        run_smartqsm(sq, limit=0)
 
 
 def test_low_points_trees_are_recorded_and_not_run(sq, fake):
     make_split(sq, [{}, {"low_points": True, "n_points": 120}, {}])
-    result = smartqsm.run_smartqsm(sq)
+    result = run_smartqsm(sq)
     assert fake.ordinals == [1, 3]
     rows = by_ordinal(metrics(sq))
     assert rows[2]["status"] == "skipped_low_points" and rows[2]["n_points"] == "120"
@@ -621,14 +509,14 @@ def test_low_points_trees_are_recorded_and_not_run(sq, fake):
 
 def test_limit_does_not_count_skipped_low_points_trees(sq, fake):
     make_split(sq, [{"low_points": True}, {}, {}, {}])
-    smartqsm.run_smartqsm(sq, limit=2)
+    run_smartqsm(sq, limit=2)
     assert fake.ordinals == [2, 3]
     assert [r["status"] for r in metrics(sq)] == ["skipped_low_points", "ok", "ok"]
 
 
 def test_skip_low_points_false_reports_missing_cloud(sq, fake):
     make_split(sq, [{}, {"low_points": True}])
-    smartqsm.run_smartqsm(sq, skip_low_points=False)
+    run_smartqsm(sq, skip_low_points=False)
     assert fake.ordinals == [1]
     row = by_ordinal(metrics(sq))[2]
     assert row["status"] == "error" and "cloud not found" in row["note"]
@@ -636,7 +524,7 @@ def test_skip_low_points_false_reports_missing_cloud(sq, fake):
 
 def test_missing_tree_map_is_a_clear_error(sq, fake):
     with pytest.raises(StageError, match="run the split stage first"):
-        smartqsm.run_smartqsm(sq)
+        run_smartqsm(sq)
 
 
 def test_tree_map_without_file_column_uses_conventional_names(sq, fake):
@@ -644,7 +532,7 @@ def test_tree_map_without_file_column_uses_conventional_names(sq, fake):
     (split / "trees").mkdir(parents=True)
     (split / "trees" / "tree_0001.laz").write_bytes(b"x")
     (split / "tree_map.csv").write_text("ordinal,n_points,base_z0_m\n1,900,0.1\n")
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     assert fake.ordinals == [1]
 
 
@@ -660,7 +548,7 @@ def test_read_tree_map_parses_types(sq):
 # ---------------------------------------------------------------------------------------------------------
 def test_metrics_csv_column_contract(sq, fake):
     make_split(sq, 2)
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     with (sq.stage_dir("smartqsm") / LC / "metrics.csv").open(newline="") as fh:
         assert next(csv.reader(fh)) == EXPECTED_COLUMNS
     assert smartqsm.METRICS_COLUMNS == EXPECTED_COLUMNS
@@ -669,10 +557,9 @@ def test_metrics_csv_column_contract(sq, fake):
 
 def test_ok_row_values_and_height_correction(sq, monkeypatch):
     f = FakeSmartQsm(sq, {1: {"dbh_cm": 16.5, "height_m": 12.4}})
-    monkeypatch.setattr(smartqsm, "run_container", f)
-    monkeypatch.setattr(smartqsm, "require_image", lambda *a, **k: None)
+    monkeypatch.setattr(smartqsm, "run_tool", f)
     make_split(sq, [{"base_z0_m": 0.1234, "n_points": 4321}])
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     (row,) = metrics(sq)
     assert row["status"] == "ok" and row["note"] == ""
     assert float(row["dbh_m"]) == pytest.approx(0.165)  # cm -> m
@@ -687,10 +574,9 @@ def test_ok_row_values_and_height_correction(sq, monkeypatch):
 
 def test_no_dbh_when_dbh_is_zero(sq, monkeypatch):
     f = FakeSmartQsm(sq, {1: {"dbh_cm": 0.0, "height_m": 3.0}})
-    monkeypatch.setattr(smartqsm, "run_container", f)
-    monkeypatch.setattr(smartqsm, "require_image", lambda *a, **k: None)
+    monkeypatch.setattr(smartqsm, "run_tool", f)
     make_split(sq, 1)
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     (row,) = metrics(sq)
     assert row["status"] == "no_dbh" and row["dbh_m"] == "" and row["height_m"] == ""  # empty unless ok
     assert float(row["height_raw_m"]) == 3.0 and "1.3 m" in row["note"]
@@ -726,7 +612,7 @@ def test_volume_check_threshold_and_missing_volume():
 
 def test_missing_base_z0_leaves_height_uncorrected_with_a_note(sq, fake):
     make_split(sq, [{"base_z0_m": ""}])
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     (row,) = metrics(sq)
     assert row["status"] == "ok" and float(row["height_m"]) == float(row["height_raw_m"])
     assert row["base_z0_m"] == "" and row["dbh_height_above_ground_m"] == "" and "base_z0_m unknown" in row["note"]
@@ -734,26 +620,24 @@ def test_missing_base_z0_leaves_height_uncorrected_with_a_note(sq, fake):
 
 def test_treedata_without_dbh_field_is_an_error_row(sq, monkeypatch):
     class NoDbh(FakeSmartQsm):
-        def __call__(self, image, args, mounts=(), **kw):
-            r = super().__call__(image, args, mounts, **kw)
+        def __call__(self, env, args, **kw):
+            r = super().__call__(env, args, **kw)
             savemat(self.calls[-1]["laz"].with_name("tree_0001_qsm.mat"), {"QSM": {"treedata": {"height_m": 5.0}}})
             return r
 
-    monkeypatch.setattr(smartqsm, "run_container", NoDbh(sq))
-    monkeypatch.setattr(smartqsm, "require_image", lambda *a, **k: None)
+    monkeypatch.setattr(smartqsm, "run_tool", NoDbh(sq))
     make_split(sq, [{}, {}])
     with pytest.raises(StageError):  # both trees broken -> nothing usable
-        smartqsm.run_smartqsm(sq, trees=[1])
+        run_smartqsm(sq, trees=[1])
     (row,) = metrics(sq)
     assert row["status"] == "error" and "DBH_cm" in row["note"] and row["dbh_m"] == ""
 
 
 def test_failed_when_no_mat_is_produced_even_with_exit_code_zero(sq, monkeypatch):
     f = FakeSmartQsm(sq, {2: {"mode": "nomat", "out": "Traceback...\nValueError: boom"}})
-    monkeypatch.setattr(smartqsm, "run_container", f)
-    monkeypatch.setattr(smartqsm, "require_image", lambda *a, **k: None)
+    monkeypatch.setattr(smartqsm, "run_tool", f)
     make_split(sq, 3)
-    result = smartqsm.run_smartqsm(sq)
+    result = run_smartqsm(sq)
     rows = by_ordinal(metrics(sq))
     assert [rows[i]["status"] for i in (1, 2, 3)] == ["ok", "failed", "ok"]  # the loop carries on
     assert "no tree_0002_qsm.mat produced" in rows[2]["note"] and "ValueError: boom" in rows[2]["note"]
@@ -763,20 +647,18 @@ def test_failed_when_no_mat_is_produced_even_with_exit_code_zero(sq, monkeypatch
 
 def test_nonzero_exit_code_is_recorded(sq, monkeypatch):
     f = FakeSmartQsm(sq, {1: {"mode": "nomat", "rc": 2}, 2: {}})
-    monkeypatch.setattr(smartqsm, "run_container", f)
-    monkeypatch.setattr(smartqsm, "require_image", lambda *a, **k: None)
+    monkeypatch.setattr(smartqsm, "run_tool", f)
     make_split(sq, 2)
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     row = by_ordinal(metrics(sq))[1]
     assert row["status"] == "failed" and "exit code 2" in row["note"]
 
 
 def test_timeout_status_and_next_tree_still_runs(sq, monkeypatch):
     f = FakeSmartQsm(sq, {1: {"mode": "timeout"}})
-    monkeypatch.setattr(smartqsm, "run_container", f)
-    monkeypatch.setattr(smartqsm, "require_image", lambda *a, **k: None)
+    monkeypatch.setattr(smartqsm, "run_tool", f)
     make_split(sq, 2)
-    result = smartqsm.run_smartqsm(sq, timeout_s=42)
+    result = run_smartqsm(sq, timeout_s=42)
     rows = by_ordinal(metrics(sq))
     assert rows[1]["status"] == "timeout" and "42 s" in rows[1]["note"] and rows[1]["dbh_m"] == ""
     assert rows[2]["status"] == "ok"
@@ -784,33 +666,30 @@ def test_timeout_status_and_next_tree_still_runs(sq, monkeypatch):
     assert (sq.stage_dir("smartqsm") / LC / "logs" / "tree_0001.log").read_text() == "partial output"
 
 
-def test_docker_error_other_than_timeout_is_an_error_row(sq, monkeypatch):
-    f = FakeSmartQsm(sq, {1: {"mode": "docker_down"}})
-    monkeypatch.setattr(smartqsm, "run_container", f)
-    monkeypatch.setattr(smartqsm, "require_image", lambda *a, **k: None)
+def test_tool_error_other_than_timeout_is_an_error_row(sq, monkeypatch):
+    f = FakeSmartQsm(sq, {1: {"mode": "cannot_start"}})
+    monkeypatch.setattr(smartqsm, "run_tool", f)
     make_split(sq, 2)
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     row = by_ordinal(metrics(sq))[1]
-    assert row["status"] == "error" and "docker" in row["note"]
+    assert row["status"] == "error" and "in-env" in row["note"]
 
 
 def test_corrupt_mat_is_an_error_row(sq, monkeypatch):
     f = FakeSmartQsm(sq, {1: {"mode": "corrupt"}})
-    monkeypatch.setattr(smartqsm, "run_container", f)
-    monkeypatch.setattr(smartqsm, "require_image", lambda *a, **k: None)
+    monkeypatch.setattr(smartqsm, "run_tool", f)
     make_split(sq, 2)
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     row = by_ordinal(metrics(sq))[1]
     assert row["status"] == "error" and "cannot read" in row["note"]
 
 
 def test_stage_fails_only_if_every_attempted_tree_failed(sq, monkeypatch):
     f = FakeSmartQsm(sq, {1: {"mode": "nomat"}, 2: {"mode": "timeout"}})
-    monkeypatch.setattr(smartqsm, "run_container", f)
-    monkeypatch.setattr(smartqsm, "require_image", lambda *a, **k: None)
+    monkeypatch.setattr(smartqsm, "run_tool", f)
     make_split(sq, [{}, {}, {"low_points": True}])
     with pytest.raises(StageError, match="no result for any of the 2 tree"):
-        smartqsm.run_smartqsm(sq)
+        run_smartqsm(sq)
     assert len(metrics(sq)) == 3  # metrics.csv is there for the post-mortem
 
 
@@ -823,7 +702,7 @@ def test_metrics_csv_is_written_after_every_tree(sq, fake):
         snapshots[ordinal] = [r["ordinal"] for r in metrics(sq)] if path.exists() else None
 
     fake.hook = hook
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     # when tree k starts, the file already holds trees 1..k-1
     assert snapshots == {1: None, 2: ["1"], 3: ["1", "2"], 4: ["1", "2", "3"]}
     assert len(metrics(sq)) == 4
@@ -839,12 +718,12 @@ def test_interrupt_keeps_finished_trees_and_resume_continues(sq, fake):
 
     fake.hook = interrupt
     with pytest.raises(KeyboardInterrupt):
-        smartqsm.run_smartqsm(sq)
+        run_smartqsm(sq)
     assert [r["ordinal"] for r in metrics(sq)] == ["1", "2"]
 
     fake.hook = None
     fake.calls.clear()
-    result = smartqsm.run_smartqsm(sq)
+    result = run_smartqsm(sq)
     assert fake.ordinals == [3, 4]  # 1 and 2 are collected from their existing .mat
     rows = by_ordinal(metrics(sq))
     assert sorted(rows) == [1, 2, 3, 4] and all(r["status"] == "ok" for r in rows.values())
@@ -855,7 +734,7 @@ def test_interrupt_keeps_finished_trees_and_resume_continues(sq, fake):
 def test_progress_log_has_counter_and_eta(sq, fake, caplog):
     make_split(sq, 3)
     with caplog.at_level(logging.INFO, logger="lidar_bridge.stages.smartqsm"):
-        smartqsm.run_smartqsm(sq)
+        run_smartqsm(sq)
     assert re.search(r"\[1/3\] tree 1 ok \d+ s, eta \d+:\d\d min", caplog.text)
     assert re.search(r"\[3/3\] tree 3 ok \d+ s\n", caplog.text + "\n")  # no eta after the last one
 
@@ -867,10 +746,10 @@ def test_format_eta(seconds, text):
 
 def test_return_value(sq, fake):
     make_split(sq, [{}, {"low_points": True}])
-    result = smartqsm.run_smartqsm(sq)
-    assert result["dir"] == f"data/out/r1/smartqsm/{LC}" and result["metrics"] == f"data/out/r1/smartqsm/{LC}/metrics.csv"
+    result = run_smartqsm(sq)
+    assert result["dir"] == f"out/r1/smartqsm/{LC}" and result["metrics"] == f"out/r1/smartqsm/{LC}/metrics.csv"
     assert result["config"] == LC and result["n_selected"] == 2
-    assert result["image"] == "lidar-smartqsm" and result["gpu"] is False
+    assert result["gpu"] is False
     assert result["counts"] == {"ok": 1, "skipped_low_points": 1} and result["seconds"] >= 0
 
 
@@ -879,10 +758,10 @@ def test_return_value(sq, fake):
 # ---------------------------------------------------------------------------------------------------------
 def test_resume_reuses_existing_results(sq, fake):
     make_split(sq, 3)
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     first = metrics(sq)
     fake.calls.clear()
-    result = smartqsm.run_smartqsm(sq)
+    result = run_smartqsm(sq)
     assert fake.calls == []  # nothing re-run
     second = metrics(sq)
     assert [(r["ordinal"], r["status"], r["dbh_m"], r["height_m"], r["seconds"]) for r in second] == [
@@ -893,22 +772,21 @@ def test_resume_reuses_existing_results(sq, fake):
 
 def test_resume_runs_only_missing_trees(sq, fake):
     make_split(sq, 3)
-    smartqsm.run_smartqsm(sq, trees=[1, 3])
+    run_smartqsm(sq, trees=[1, 3])
     fake.calls.clear()
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     assert fake.ordinals == [2]
     assert [r["ordinal"] for r in metrics(sq)] == ["1", "2", "3"]
 
 
 def test_failed_trees_are_retried_on_resume(sq, monkeypatch):
     f = FakeSmartQsm(sq, {2: {"mode": "nomat"}})
-    monkeypatch.setattr(smartqsm, "run_container", f)
-    monkeypatch.setattr(smartqsm, "require_image", lambda *a, **k: None)
+    monkeypatch.setattr(smartqsm, "run_tool", f)
     make_split(sq, 2)
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     f.calls.clear()
     f.behaviour = {}
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     assert f.ordinals == [2]
     assert [r["status"] for r in metrics(sq)] == ["ok", "ok"]
 
@@ -916,74 +794,72 @@ def test_failed_trees_are_retried_on_resume(sq, monkeypatch):
 @pytest.mark.parametrize("kwargs", [{"force": True}, {"resume": False}])
 def test_force_and_no_resume_rerun_everything(sq, fake, kwargs):
     make_split(sq, 3)
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     fake.calls.clear()
-    smartqsm.run_smartqsm(sq, **kwargs)
+    run_smartqsm(sq, **kwargs)
     assert fake.ordinals == [1, 2, 3]
 
 
 def test_stale_mat_is_deleted_before_a_rerun_so_a_failure_is_not_masked(sq, monkeypatch):
     make_split(sq, 2)
     f = FakeSmartQsm(sq)
-    monkeypatch.setattr(smartqsm, "run_container", f)
-    monkeypatch.setattr(smartqsm, "require_image", lambda *a, **k: None)
-    smartqsm.run_smartqsm(sq)
+    monkeypatch.setattr(smartqsm, "run_tool", f)
+    run_smartqsm(sq)
     f.behaviour = {1: {"mode": "nomat"}}
-    smartqsm.run_smartqsm(sq, force=True)
+    run_smartqsm(sq, force=True)
     assert [r["status"] for r in metrics(sq)] == ["failed", "ok"]
     assert not (sq.stage_dir("smartqsm") / LC / "work" / "tree_0001_qsm.mat").exists()
 
 
 def test_changed_input_cloud_invalidates_the_old_result(sq, fake):
     split = make_split(sq, 2)
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     fake.calls.clear()
     (split / "trees" / "tree_0002.laz").write_bytes(b"split was re-run with other parameters")
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     assert fake.ordinals == [2]
 
 
 def test_unreadable_old_result_is_rerun(sq, fake):
     make_split(sq, 2)
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     fake.calls.clear()
     (sq.stage_dir("smartqsm") / LC / "work" / "tree_0001_qsm.mat").write_bytes(b"half a file")
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     assert fake.ordinals == [1]
 
 
 def test_changed_config_refuses_to_reuse_results_unless_forced(sq, fake):
     make_split(sq, 2)
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     fake.calls.clear()
     with pytest.raises(StageError, match="differs from the config"):
-        smartqsm.run_smartqsm(sq, overrides={"voxel_down_size": 0.05})
+        run_smartqsm(sq, overrides={"voxel_down_size": 0.05})
     assert not fake.calls
     assert yaml.safe_load((sq.stage_dir("smartqsm") / LC / "config.yaml").read_text())["voxel_down_size"] == 0.01  # untouched
 
-    smartqsm.run_smartqsm(sq, overrides={"voxel_down_size": 0.05}, force=True)
+    run_smartqsm(sq, overrides={"voxel_down_size": 0.05}, force=True)
     assert fake.ordinals == [1, 2]
     assert yaml.safe_load((sq.stage_dir("smartqsm") / LC / "config.yaml").read_text())["voxel_down_size"] == 0.05
 
 
 def test_same_overrides_again_resume_fine(sq, fake):
     make_split(sq, 2)
-    smartqsm.run_smartqsm(sq, overrides={"voxel_down_size": 0.05})
+    run_smartqsm(sq, overrides={"voxel_down_size": 0.05})
     fake.calls.clear()
-    smartqsm.run_smartqsm(sq, overrides={"voxel_down_size": 0.05})
+    run_smartqsm(sq, overrides={"voxel_down_size": 0.05})
     assert fake.calls == []
 
 
 def test_subset_run_keeps_the_rows_of_the_other_trees(sq, monkeypatch):
     f = FakeSmartQsm(sq)
-    monkeypatch.setattr(smartqsm, "run_container", f)
-    monkeypatch.setattr(smartqsm, "require_image", lambda *a, **k: None)
+    monkeypatch.setattr(smartqsm, "run_tool", f)
     make_split(sq, 4)
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     first = by_ordinal(metrics(sq))
     f.calls.clear()
     f.behaviour = {2: {"dbh_cm": 33.0}}
-    smartqsm.run_smartqsm(sq, trees=[2], force=True)  # re-run ONE tree
+    run_smartqsm(sq, trees=[2], force=True)  # re-run ONE tree
     assert f.ordinals == [2]
     rows = by_ordinal(metrics(sq))
     assert sorted(rows) == [1, 2, 3, 4]  # the other rows survive
@@ -997,10 +873,10 @@ def test_subset_run_keeps_the_rows_of_the_other_trees(sq, monkeypatch):
 
 def test_subset_run_without_force_reuses_the_tree_and_keeps_the_table(sq, fake):
     make_split(sq, 3)
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     first = metrics(sq)
     fake.calls.clear()
-    result = smartqsm.run_smartqsm(sq, trees=[2])
+    result = run_smartqsm(sq, trees=[2])
     assert fake.calls == [] and result["n_selected"] == 1 and result["counts"] == {"ok": 1}
     after = by_ordinal(metrics(sq))
     assert sorted(after) == [1, 2, 3] and "reused" in after[2]["note"]
@@ -1009,36 +885,36 @@ def test_subset_run_without_force_reuses_the_tree_and_keeps_the_table(sq, fake):
 
 def test_subset_runs_accumulate_into_one_sorted_table(sq, fake):
     make_split(sq, 4)
-    smartqsm.run_smartqsm(sq, trees=[3])
+    run_smartqsm(sq, trees=[3])
     assert [r["ordinal"] for r in metrics(sq)] == ["3"]
-    smartqsm.run_smartqsm(sq, trees=[1])
-    smartqsm.run_smartqsm(sq, trees=[4, 2])
+    run_smartqsm(sq, trees=[1])
+    run_smartqsm(sq, trees=[4, 2])
     assert [r["ordinal"] for r in metrics(sq)] == ["1", "2", "3", "4"]
     assert not list((sq.stage_dir("smartqsm") / LC).glob("*.tmp"))
 
 
 def test_metrics_are_merged_after_every_tree_of_a_subset_run(sq, fake):
     make_split(sq, 4)
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     snapshots = {}
 
     def hook(ordinal, laz):
         snapshots[ordinal] = [r["ordinal"] for r in metrics(sq)]
 
     fake.hook = hook
-    smartqsm.run_smartqsm(sq, trees=[2, 3], force=True)
+    run_smartqsm(sq, trees=[2, 3], force=True)
     assert snapshots == {2: ["1", "2", "3", "4"], 3: ["1", "2", "3", "4"]}  # never a shortened table in between
 
 
 def test_fingerprint_is_written_next_to_the_metrics(sq, fake):
     split = make_split(sq, 2)
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     out = sq.stage_dir("smartqsm") / LC
     fingerprint, extra = read_fingerprint(out)
     assert (out / FINGERPRINT_FILE).is_file() and (out / "metrics.csv").is_file()
     assert fingerprint == tree_map_fingerprint(split)
     assert re.fullmatch(r"config=[0-9a-f]{8} skip_low_points=true", extra)
-    smartqsm.run_smartqsm(sq, skip_low_points=False, force=True, trees=[1])
+    run_smartqsm(sq, skip_low_points=False, force=True, trees=[1])
     assert read_fingerprint(out)[1].endswith("skip_low_points=false") and read_fingerprint(out)[0] == fingerprint
 
 
@@ -1050,44 +926,44 @@ def test_fingerprint_is_in_place_after_the_first_tree(sq, fake):
         seen[ordinal] = read_fingerprint(sq.stage_dir("smartqsm") / LC)
 
     fake.hook = hook
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     assert seen[1] is None and seen[2] is not None and seen[3] == seen[2]  # written together with the first metrics.csv
 
 
 def test_subset_run_after_a_changed_tree_map_drops_the_old_rows_with_a_warning(sq, fake, caplog):
     make_split(sq, 3)
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     old = read_fingerprint(sq.stage_dir("smartqsm") / LC)[0]
     make_split(sq, [{"n_points": 9999}, {}, {}])  # the split stage ran again: tree_map.csv differs
     fake.calls.clear()
     with caplog.at_level(logging.WARNING, logger="lidar_bridge.stages.smartqsm"):
-        smartqsm.run_smartqsm(sq, trees=[2])
+        run_smartqsm(sq, trees=[2])
     assert "older rows from a different split were dropped" in caplog.text
     assert [r["ordinal"] for r in metrics(sq)] == ["2"]  # the old rows of 1 and 3 belong to the previous split
     new = read_fingerprint(sq.stage_dir("smartqsm") / LC)[0]
     assert new != old and new == tree_map_fingerprint(sq.stage_dir("split"))
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="lidar_bridge.stages.smartqsm"):
-        smartqsm.run_smartqsm(sq, trees=[3])  # now consistent again: merge, no warning
+        run_smartqsm(sq, trees=[3])  # now consistent again: merge, no warning
     assert "dropped" not in caplog.text and [r["ordinal"] for r in metrics(sq)] == ["2", "3"]
 
 
 def test_full_run_after_a_changed_split_rewrites_the_table(sq, fake, caplog):
     make_split(sq, 4)
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     make_split(sq, 3, n_points=777)  # 3DFin now finds 3 trees
     with caplog.at_level(logging.WARNING, logger="lidar_bridge.stages.smartqsm"):
-        smartqsm.run_smartqsm(sq)
+        run_smartqsm(sq)
     assert "older rows from a different split were dropped" in caplog.text
     assert [r["ordinal"] for r in metrics(sq)] == ["1", "2", "3"]  # no leftover row of ordinal 4
 
 
 def test_table_without_a_fingerprint_is_not_merged(sq, fake, caplog):
     make_split(sq, 3)
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     (sq.stage_dir("smartqsm") / LC / FINGERPRINT_FILE).unlink()  # a table from before fingerprints existed
     with caplog.at_level(logging.WARNING, logger="lidar_bridge.stages.smartqsm"):
-        smartqsm.run_smartqsm(sq, trees=[2])
+        run_smartqsm(sq, trees=[2])
     assert "older rows from a different split were dropped" in caplog.text and "no source fingerprint" in caplog.text
     assert [r["ordinal"] for r in metrics(sq)] == ["2"]
     assert read_fingerprint(sq.stage_dir("smartqsm") / LC) is not None
@@ -1096,34 +972,34 @@ def test_table_without_a_fingerprint_is_not_merged(sq, fake, caplog):
 def test_first_run_has_nothing_to_drop_and_no_warning(sq, fake, caplog):
     make_split(sq, 2)
     with caplog.at_level(logging.WARNING, logger="lidar_bridge.stages.smartqsm"):
-        smartqsm.run_smartqsm(sq, trees=[2])
+        run_smartqsm(sq, trees=[2])
     assert "dropped" not in caplog.text and [r["ordinal"] for r in metrics(sq)] == ["2"]
 
 
 def test_forced_config_change_does_not_keep_rows_of_the_old_config(sq, fake, caplog):
     make_split(sq, 3)
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     with caplog.at_level(logging.WARNING, logger="lidar_bridge.stages.smartqsm"):
-        smartqsm.run_smartqsm(sq, overrides={"voxel_down_size": 0.05}, force=True, trees=[2])  # work/ is discarded
+        run_smartqsm(sq, overrides={"voxel_down_size": 0.05}, force=True, trees=[2])  # work/ is discarded
     assert "older rows from a different configuration were dropped" in caplog.text
     assert [r["ordinal"] for r in metrics(sq)] == ["2"]
     caplog.clear()
-    smartqsm.run_smartqsm(sq, overrides={"voxel_down_size": 0.05}, trees=[1])  # same (new) config: merge
+    run_smartqsm(sq, overrides={"voxel_down_size": 0.05}, trees=[1])  # same (new) config: merge
     assert [r["ordinal"] for r in metrics(sq)] == ["1", "2"]
 
 
 def test_full_forced_run_after_a_changed_split_still_works(sq, fake):
     make_split(sq, 2)
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
     make_split(sq, [{"n_points": 1234}, {}])
     fake.calls.clear()
-    smartqsm.run_smartqsm(sq, force=True)
+    run_smartqsm(sq, force=True)
     assert fake.ordinals == [1, 2] and [r["ordinal"] for r in metrics(sq)] == ["1", "2"]
 
 
 def test_interrupted_subset_run_keeps_the_merged_table(sq, fake):
     make_split(sq, 4)
-    smartqsm.run_smartqsm(sq)
+    run_smartqsm(sq)
 
     def interrupt(ordinal, laz):
         if ordinal == 3:
@@ -1131,88 +1007,55 @@ def test_interrupted_subset_run_keeps_the_merged_table(sq, fake):
 
     fake.hook = interrupt
     with pytest.raises(KeyboardInterrupt):
-        smartqsm.run_smartqsm(sq, trees=[2, 3], force=True)
+        run_smartqsm(sq, trees=[2, 3], force=True)
     assert [r["ordinal"] for r in metrics(sq)] == ["1", "2", "3", "4"]  # tree 3 keeps its old row, 2 is the new one
 
 
 def test_dry_run_with_existing_results_touches_nothing(sq, fake, monkeypatch):
     make_split(sq, 3)
-    smartqsm.run_smartqsm(sq)
-    monkeypatch.setattr(smartqsm, "run_container", docker_runner.run_container)  # the real one only logs in a dry run
+    run_smartqsm(sq)
+    monkeypatch.setattr(smartqsm, "run_tool", runner.run_tool)  # the real one only logs in a dry run
     out = sq.stage_dir("smartqsm") / LC
     before = {p.relative_to(out).as_posix(): p.read_bytes() for p in out.rglob("*") if p.is_file()}
     make_split(sq, [{"n_points": 4242}, {}, {}])  # even a stale table is only reported on, never changed
     dry = replace(sq, dry_run=True)
-    smartqsm.run_smartqsm(dry, trees=[2])
+    run_smartqsm(dry, trees=[2])
     assert {p.relative_to(out).as_posix(): p.read_bytes() for p in out.rglob("*") if p.is_file()} == before
 
 
 # ---------------------------------------------------------------------------------------------------------
 # dry run
 # ---------------------------------------------------------------------------------------------------------
-def test_dry_run_logs_commands_and_touches_nothing(sq, monkeypatch, caplog):
+def test_dry_run_logs_commands_and_touches_nothing(sq, caplog):
     make_split(sq, [{}, {"low_points": True}, {}])
     dry = replace(sq, dry_run=True)
-    monkeypatch.setattr(smartqsm, "require_image", lambda *a, **k: None)
     with caplog.at_level(logging.INFO):
-        result = smartqsm.run_smartqsm(dry, overrides={"voxel_down_size": 0.03})
+        result = run_smartqsm(dry, overrides={"voxel_down_size": 0.03})
     assert not (sq.run_dir / "smartqsm").exists()  # no config.yaml, no work dir, no metrics.csv
     text = caplog.text
-    cfg = f"/data/out/r1/smartqsm/{LC}"
-    assert "[dry-run] would run: docker run --rm -i --network none --mount " in text
-    assert f"source={HOST}/data,target=/data" in text
-    assert f"lidar-smartqsm -t -y -c {cfg}/config.yaml {cfg}/work/tree_0001.laz" in text
-    assert f"{cfg}/work/tree_0003.laz" in text and "tree_0002.laz" not in text  # low-points tree is not run
+    out = sq.stage_dir("smartqsm") / LC
+    prefix = ["in-env", "smartqsm", "smartqsm-run", "-t", "-y", "-c", str(out / "config.yaml")]
+    assert f"[dry-run] would run: {runner.format_command([*prefix, str(out / 'work' / 'tree_0001.laz')])}" in text
+    assert str(out / "work" / "tree_0003.laz") in text and "tree_0002.laz" not in text  # low-points tree is not run
     assert "tree 2: skipped" in text
     assert result["dry_run"] is True and result["n_selected"] == 3
 
 
-def test_dry_run_with_gpu_shows_the_gpu_command(sqg, monkeypatch, caplog):
+def test_dry_run_with_a_gpu_preset_shows_the_commands(sqg, caplog):
     make_split(sqg, [{}, {}])
     dry = replace(sqg, dry_run=True)
-    monkeypatch.setattr(smartqsm, "image_exists", lambda *a, **k: True)
     with caplog.at_level(logging.INFO):
-        result = smartqsm.run_smartqsm(dry, config=GPU_PRESET, gpu=True)
-    cfg = f"/data/out/r1/smartqsm/{GPU_PRESET}"
-    assert "[dry-run] would run: docker run --rm -i --network none --gpus all --mount " in caplog.text
-    assert f"lidar-smartqsm-gpu -t -y -c {cfg}/config.yaml {cfg}/work/tree_0001.laz" in caplog.text
-    assert f"{cfg}/work/tree_0002.laz" in caplog.text
-    assert result["dry_run"] is True and result["image"] == "lidar-smartqsm-gpu" and result["gpu"] is True
+        result = run_smartqsm(dry, config=GPU_PRESET)
+    out = sqg.stage_dir("smartqsm") / GPU_PRESET
+    assert "[dry-run] would run: in-env smartqsm smartqsm-run -t -y -c " in caplog.text
+    assert str(out / "work" / "tree_0001.laz") in caplog.text and str(out / "work" / "tree_0002.laz") in caplog.text
+    assert result["dry_run"] is True and result["gpu"] is True
     assert not (sqg.run_dir / "smartqsm").exists()
 
 
-def test_dry_run_without_gpu_has_no_gpu_flag(sqg, monkeypatch, caplog):
-    make_split(sqg, 1)
-    dry = replace(sqg, dry_run=True)
-    monkeypatch.setattr(smartqsm, "require_image", lambda *a, **k: None)
-    with caplog.at_level(logging.INFO):
-        smartqsm.run_smartqsm(dry, config=CPU_PRESET)
-    assert "--gpus" not in caplog.text and "lidar-smartqsm -t -y -c" in caplog.text and "lidar-smartqsm-gpu" not in caplog.text
-
-
-def test_dry_run_with_a_missing_gpu_image_only_warns(sqg, monkeypatch, caplog):
-    make_split(sqg, 1)
-    dry = replace(sqg, dry_run=True)
-    monkeypatch.setattr(smartqsm, "image_exists", lambda *a, **k: False)
-    with caplog.at_level(logging.INFO):
-        result = smartqsm.run_smartqsm(dry, config=GPU_PRESET, gpu=True)
-    assert result["dry_run"] is True
-    assert "[dry-run] docker image 'lidar-smartqsm-gpu' not found" in caplog.text and "run_pipeline.bat --gpu --build-only" in caplog.text
-    assert "lidar-smartqsm-gpu -t -y -c" in caplog.text  # the command is still shown
-
-
-def test_dry_run_with_a_gpu_preset_but_no_gpu_flag_fails_early(sqg, monkeypatch):
-    make_split(sqg, 1)
-    dry = replace(sqg, dry_run=True)
-    monkeypatch.setattr(smartqsm, "require_image", lambda *a, **k: None)
-    with pytest.raises(StageError, match="smartqsm.gpu=true"):  # the real run would fail the same way, so the rehearsal says so
-        smartqsm.run_smartqsm(dry, config=GPU_PRESET)
-
-
-def test_dry_run_without_split_or_presets_only_warns(ctx, monkeypatch, caplog):
+def test_dry_run_without_split_or_presets_only_warns(ctx, caplog):
     """The CLI dry run of the whole pipeline has no split dir and (in tests) no presets."""
     dry = replace(ctx, dry_run=True)
-    monkeypatch.setattr(smartqsm, "require_image", lambda *a, **k: None)
     with caplog.at_level(logging.INFO):
         result = smartqsm.run_smartqsm(dry)
     assert "[dry-run]" in caplog.text and "placeholder tree" in caplog.text and "tree_0001.laz" in caplog.text
@@ -1220,43 +1063,11 @@ def test_dry_run_without_split_or_presets_only_warns(ctx, monkeypatch, caplog):
     assert not ctx.run_dir.exists()
 
 
-def test_dry_run_without_split_accepts_an_explicit_tree_selection(ctx, monkeypatch, caplog):
+def test_dry_run_without_split_accepts_an_explicit_tree_selection(ctx, caplog):
     """Rehearsing a long run with smartqsm.trees=[...] must not fail just because split has not produced tree_map.csv."""
     dry = replace(ctx, dry_run=True)
-    monkeypatch.setattr(smartqsm, "require_image", lambda *a, **k: None)
     with caplog.at_level(logging.INFO):
         result = smartqsm.run_smartqsm(dry, trees=[3, 14, 29])
     assert result["n_selected"] == 3
     assert all(f"tree_{o:04d}.laz" in caplog.text for o in (3, 14, 29))
     assert not ctx.run_dir.exists()
-
-
-# ---------------------------------------------------------------------------------------------------------
-# hydra
-# ---------------------------------------------------------------------------------------------------------
-def test_new_parameters_are_exposed_to_hydra(tmp_path):
-    from hydra import compose, initialize_config_dir
-    from hydra.core.global_hydra import GlobalHydra
-    from hydra_zen import instantiate
-
-    from lidar_bridge.configs import CONFIG_NAME, register_configs
-
-    register_configs()
-    GlobalHydra.instance().clear()
-    try:
-        with initialize_config_dir(config_dir=str(tmp_path), version_base="1.3"):
-            default = compose(config_name=CONFIG_NAME)
-            cfg = compose(
-                config_name=CONFIG_NAME,
-                overrides=[
-                    "smartqsm.trees=[3,8]", "smartqsm.limit=2", "smartqsm.resume=false", "smartqsm.force=true",
-                    "smartqsm.skip_low_points=false", "+smartqsm.overrides.voxel_down_size=0.02",
-                ],
-            )  # fmt: skip
-    finally:
-        GlobalHydra.instance().clear()
-    assert default.smartqsm.trees is None and default.smartqsm.limit is None
-    assert default.smartqsm.timeout_s == 1800 and default.smartqsm.resume is True and default.smartqsm.force is False
-    kw = instantiate(cfg.smartqsm).keywords
-    assert kw["trees"] == [3, 8] and kw["limit"] == 2 and kw["resume"] is False and kw["force"] is True
-    assert kw["skip_low_points"] is False and kw["overrides"] == {"voxel_down_size": 0.02}

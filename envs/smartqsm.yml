@@ -1,0 +1,9 @@
+# Python for SmartQSM and the pipeline code. It must be 3.12: SmartQSM uses same-quote nested f-strings and the open3d wheels
+# stop at cp312. Its packages come from pip with requirements.lock.txt as constraints (see the Dockerfile).
+name: smartqsm
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - tk

@@ -183,7 +183,7 @@ def test_end_to_end_numbers_naming_and_files(ref_ctx, caplog):
     ]  # fmt: skip
     assert (out / "scatter_dbh.png").read_bytes().startswith(PNG_MAGIC)
     assert result["pipelines"] == ["3dfin", "smartqsm:layerwise-clustering", "smartqsm:space-colonization", "arbor"]
-    assert result["plots"] == ["data/out/r1/compare/scatter_dbh.png", "data/out/r1/compare/scatter_height.png"]
+    assert result["plots"] == ["out/r1/compare/scatter_dbh.png", "out/r1/compare/scatter_height.png"]
 
     errors, summary = read_csv(ref_ctx, "errors.csv"), read_csv(ref_ctx, "summary.csv")
     assert list(errors.columns) == [
@@ -449,7 +449,7 @@ def test_xlsx_reference_with_sheet_param(ctx, project):
     assert s.n == 3 and s.bias == pytest.approx((0.01 + 0.01 + 0.01) / 3, abs=1e-9)
     s = row(summary, pipeline="3dfin", metric="height")
     assert s.n == 2 and s.n_extra == 1 and s.bias == pytest.approx(0.5)  # tree 3 has no reference height
-    compare.run_compare(ctx, sheet="1")  # index spelling, as hydra passes it
+    compare.run_compare(ctx, sheet="1")  # index spelling, as a --params file may pass it
 
 
 def test_duplicate_reference_ids_fail_the_stage(ctx, project):
@@ -469,14 +469,14 @@ def test_reference_without_height_column_compares_dbh_only(ctx, project, caplog)
         result = compare.run_compare(ctx)
     summary = read_csv(ctx, "summary.csv")
     assert set(summary.metric) == {"dbh"}
-    assert result["plots"] == ["data/out/r1/compare/scatter_dbh.png"]
+    assert result["plots"] == ["out/r1/compare/scatter_dbh.png"]
     assert not (ctx.stage_dir("compare") / "scatter_height.png").exists()
 
 
 def test_explicit_columns_and_columns_file_precedence(ctx, project):
     path = project / "data" / "in" / "x.csv"
     path.write_text("A;B;C;D\n1;30;20;99\n2;40;25;99\n", encoding="utf-8")
-    yaml_path = project / "configs" / "cols.yaml"
+    yaml_path = project / "data" / "configs" / "cols.yaml"
     yaml_path.parent.mkdir()
     yaml_path.write_text(
         "tree_id: {column: A}\ndbh: {column: D, unit: cm}\nheight: {column: C, unit: m}\ncsv: {sep: ';'}\n",
@@ -540,7 +540,7 @@ def test_missing_or_absent_reference(ctx):
     with pytest.raises(StageError, match="needs a reference table"):
         compare.run_compare(ctx)
     with pytest.raises(StageError, match="reference file not found"):
-        compare.run_compare(replace(ctx, reference=ctx.project_dir / "data" / "in" / "nope.csv"))
+        compare.run_compare(replace(ctx, reference=ctx.data_dir / "in" / "nope.csv"))
 
 
 def test_dry_run_writes_nothing_and_never_raises_on_bad_reference(ctx, project, caplog):
@@ -553,17 +553,16 @@ def test_dry_run_writes_nothing_and_never_raises_on_bad_reference(ctx, project, 
     assert compare.run_compare(replace(ctx, dry_run=True))["dry_run"] is True  # no reference at all
 
 
-def test_signature_is_exposed_to_hydra_zen():
-    from hydra_zen import instantiate
+def test_signature_defaults_are_what_the_params_file_can_set():
+    """``--params`` keys are checked against the signature of ``run_compare`` (see ``lidar_bridge.cli.load_params``)."""
+    import inspect
 
-    from lidar_bridge.configs import stage_config
-
-    partial = instantiate(stage_config(compare.run_compare))
-    assert partial.keywords["plots"] is True and partial.keywords["dbh_unit"] == "auto"
-    assert partial.keywords["columns_file"] is None and partial.keywords["sheet"] is None
-    assert partial.keywords["allow_stale"] is False
-    assert partial.keywords["exclude_ambiguous"] is False and partial.keywords["exclude_estimated"] is False
-    assert set(partial.keywords) >= {
+    defaults = {name: p.default for name, p in inspect.signature(compare.run_compare).parameters.items() if name != "ctx"}
+    assert defaults["plots"] is True and defaults["dbh_unit"] == "auto"
+    assert defaults["columns_file"] is None and defaults["sheet"] is None
+    assert defaults["allow_stale"] is False
+    assert defaults["exclude_ambiguous"] is False and defaults["exclude_estimated"] is False
+    assert set(defaults) >= {
         "columns_file", "tree_id_col", "dbh_col", "dbh_unit", "height_col", "height_unit", "sheet", "plots",
         "allow_stale", "exclude_ambiguous", "exclude_estimated",
     }  # fmt: skip

@@ -1,8 +1,8 @@
-"""Stage 1: 3DFin (CLI) in the ``lidar-3dfin`` container.
+"""Stage 1: 3DFin (CLI) in the ``3dfin`` environment.
 
 Contract
 --------
-Reads ``ctx.input`` (a .las/.laz inside the project) and writes into ``data/out/<run>/dfin/``::
+Reads ``ctx.input`` (a .las/.laz inside the data folder) and writes into ``out/<run>/dfin/``::
 
     params.ini                          3DFin parameters (template + ini_overrides), written by this stage
     <stem>.xlsx                         DBH / height tables (or the ``<stem>_*.txt`` files with export_txt=True)
@@ -12,8 +12,8 @@ Reads ``ctx.input`` (a .las/.laz inside the project) and writes into ``data/out/
 
 The equivalent manual command is::
 
-    docker run --rm -v <host>/data:/data lidar-3dfin cli /data/<input> /data/out/<run>/dfin \
-        /data/out/<run>/dfin/params.ini [--normalize] [--denoise] [--export_txt]
+    in-env 3dfin 3DFin cli /data/<input> /data/out/<run>/dfin /data/out/<run>/dfin/params.ini \
+        [--normalize] [--denoise] [--export_txt]
 """
 
 from __future__ import annotations
@@ -24,29 +24,27 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from lidar_bridge.docker_runner import require_image, run_container
-from lidar_bridge.paths import PathOutsideProjectError, RunContext
+from lidar_bridge.paths import RunContext
+from lidar_bridge.runner import ENV_3DFIN, run_tool
 from lidar_bridge.stages._common import StageError
 
 log = logging.getLogger("lidar_bridge.stages.dfin")
 
-#: Parameter template shipped with the (unmodified) 3DFin submodule, relative to the project directory.
+#: Parameter template shipped with the (unmodified) 3DFin submodule, relative to the install directory.
 TEMPLATE_INI = Path("third_party/3DFin/src/three_d_fin/3DFinconfig.ini")
 INI_SECTIONS = ("basic", "advanced", "expert")
 LAS_SUFFIXES = (".las", ".laz")
-#: Where an input that lies outside ``data/`` (e.g. Example_data/) is mounted, read-only.
-EXTRA_INPUT_MOUNT = "/input"
 
 
 # ---------------------------------------------------------------------------------------------------------
 # params.ini
 # ---------------------------------------------------------------------------------------------------------
-def load_template(project_dir: Path, template: Path | None = None) -> configparser.ConfigParser:
+def load_template(install_dir: Path, template: Path | None = None) -> configparser.ConfigParser:
     """Parse the 3DFin template ini, keeping the case of keys."""
-    path = project_dir / (template or TEMPLATE_INI)
+    path = install_dir / (template or TEMPLATE_INI)
     if not path.is_file():
         raise StageError(
-            f"3DFin parameter template not found: {path}. Is the submodule checked out? "
+            f"3DFin parameter template not found: {path}. Was the image built with the submodules checked out? "
             "(git submodule update --init third_party/3DFin)"
         )
     parser = configparser.ConfigParser(interpolation=None)
@@ -66,8 +64,7 @@ def flatten_ini_overrides(parser: configparser.ConfigParser, overrides: Mapping[
 
     Accepted spellings (they can be mixed)::
 
-        {"basic": {"upper_limit": 4.0}}                nested dict (what hydra produces from
-                                                       +dfin.ini_overrides.basic.upper_limit=4.0)
+        {"basic": {"upper_limit": 4.0}}                nested dict
         {"basic.upper_limit": 4.0}                     "section.key"
         {"upper_limit": 4.0}                           bare key, if it is unique across the sections
 
@@ -105,9 +102,9 @@ def flatten_ini_overrides(parser: configparser.ConfigParser, overrides: Mapping[
     return flat
 
 
-def build_params(project_dir: Path, ini_overrides: Mapping[str, Any] | None = None) -> configparser.ConfigParser:
+def build_params(install_dir: Path, ini_overrides: Mapping[str, Any] | None = None) -> configparser.ConfigParser:
     """Template + overrides, ready to be written."""
-    parser = load_template(project_dir)
+    parser = load_template(install_dir)
     for (section, key), value in flatten_ini_overrides(parser, ini_overrides).items():
         parser[section][key] = value
     return parser
@@ -163,8 +160,7 @@ def run_dfin(
     normalize: bool = True,
     denoise: bool = False,
     export_txt: bool = False,
-    ini_overrides: dict = {},  # noqa: B006  (never mutated; hydra-zen turns it into a config field)
-    image: str = "lidar-3dfin",
+    ini_overrides: dict | None = None,
 ) -> dict:
     """Run 3DFin on ``ctx.input``.
 
@@ -178,22 +174,20 @@ def run_dfin(
         ``--export_txt``: write ASCII tables instead of the .xlsx workbook.
     ini_overrides
         Changes to the 3DFin parameter template, e.g. ``{"basic": {"upper_limit": 4.0}}`` or
-        ``{"basic.upper_limit": 4.0}``. From the command line: ``+dfin.ini_overrides.basic.upper_limit=4.0``.
-    image
-        Docker image tag (ENTRYPOINT ``3DFin``).
+        ``{"basic.upper_limit": 4.0}``. Set it in the ``--params`` file.
 
     Returns
     -------
     dict
-        ``{"dir", "stem", "table", "tree_las", "stripe_las", "params"}`` as paths relative to the project.
+        ``{"dir", "stem", "table", "tree_las", "stripe_las", "params"}`` as paths relative to the data folder.
     """
     if ctx.input is None:
-        raise StageError("the dfin stage needs an input point cloud: pass input=data/in/<file>.laz")
+        raise StageError("the dfin stage needs an input point cloud, e.g. in/<file>.laz")
     in_path = ctx.input
     if in_path.suffix.lower() not in LAS_SUFFIXES:
         raise StageError(f"3DFin reads .las/.laz files, got {in_path.name!r}")
     if not in_path.is_file():
-        msg = f"input file not found: {in_path} (host: {ctx.host(in_path)}). Put it under data/in/."
+        msg = f"input file not found: {in_path}"
         if not ctx.dry_run:
             raise StageError(msg)
         log.warning("[dry-run] %s", msg)
@@ -202,22 +196,12 @@ def run_dfin(
     out_dir = ctx.stage_dir("dfin")
     params_path = out_dir / "params.ini"
 
-    parser = build_params(ctx.project_dir, ini_overrides)
+    parser = build_params(ctx.install_dir, ini_overrides)
     changed = flatten_ini_overrides(parser, ini_overrides)
     log.info("params.ini: 3DFin template%s", f" with overrides {dict(('.'.join(k), v) for k, v in changed.items())}" if changed else "")
 
-    # Mounts: the whole data/ dir at /data (rw), plus the input's folder read-only if it lies outside data/.
-    mounts = [ctx.mount(ctx.data_dir, "/data")]
-    try:
-        in_container = ctx.container_path(in_path)
-    except PathOutsideProjectError:
-        mounts.append(ctx.mount(in_path.parent, EXTRA_INPUT_MOUNT, readonly=True))
-        in_container = f"{EXTRA_INPUT_MOUNT}/{in_path.name}"
-    out_container = ctx.container_path(out_dir)
-    args = ["cli", in_container, out_container, f"{out_container}/params.ini"]
+    args = ["3DFin", "cli", str(in_path), str(out_dir), str(params_path)]
     args += [flag for flag, on in (("--normalize", normalize), ("--denoise", denoise), ("--export_txt", export_txt)) if on]
-
-    require_image(image, dry_run=ctx.dry_run)
 
     if ctx.dry_run:
         log.info("[dry-run] would clear %s and write %s", out_dir, params_path)
@@ -226,14 +210,7 @@ def run_dfin(
         ctx.reset_stage_dir("dfin")  # stale 3DFin outputs would otherwise be mistaken for fresh ones
         write_params_ini(parser, params_path)
 
-    result = run_container(
-        image,
-        args,
-        mounts,
-        network="none",  # 3DFin needs no network
-        dry_run=ctx.dry_run,
-        log_prefix="3dfin",
-    )
+    result = run_tool(ENV_3DFIN, args, dry_run=ctx.dry_run, log_prefix="3dfin")
 
     if ctx.dry_run:
         return {"dir": str(ctx.rel(out_dir)), "stem": stem, "dry_run": True}

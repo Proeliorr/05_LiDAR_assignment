@@ -8,8 +8,6 @@ import pytest
 
 from lidar_bridge.paths import RunContext
 
-HOST_DIR = "D:/Podyplomowe/05_Proximity_Lidar"
-
 # Same layout / case as third_party/3DFin/src/three_d_fin/3DFinconfig.ini, trimmed, plus one key ("dup") that exists
 # in two sections to exercise the ambiguity check.
 TEMPLATE_INI = """\
@@ -46,7 +44,7 @@ def project(tmp_path: Path) -> Path:
 def ctx(project: Path) -> RunContext:
     return RunContext(
         run_name="r1",
-        host_project_dir=HOST_DIR,
-        project_dir=project,
+        data_dir=project / "data",
+        install_dir=project,
         input=project / "data" / "in" / "plot_01.laz",
     )
