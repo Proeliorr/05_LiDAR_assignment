@@ -1,0 +1,61 @@
+# Images for the 3DFin -> (SmartQSM | arbor) pipeline.
+#
+# Only `bridge` is ever started through compose (`docker compose run bridge ...`).
+# It launches the stage images itself with `docker run` over the mounted docker.sock (the GPU
+# one with `--gpus all`), so the stage services here exist purely so that `docker compose build`
+# builds every image under a stable tag. Build context is the repo root for all of them (the Dockerfiles COPY
+# from third_party/ and bridge/).
+#
+# HOST_PROJECT_DIR must be the Windows project path with forward slashes
+# (e.g. D:/Podyplomowe/05_Proximity_Lidar); run_pipeline.bat sets it. The daemon resolves
+# bind-mount sources on the host, so the bridge builds every `-v` for sibling containers from it.
+name: lidar
+
+services:
+  dfin:
+    image: lidar-3dfin
+    build:
+      context: .
+      dockerfile: docker/3dfin/Dockerfile
+
+  smartqsm:
+    image: lidar-smartqsm
+    build:
+      context: .
+      dockerfile: docker/smartqsm/Dockerfile
+      args:
+        WITH_GPU: "0"
+
+  # CUDA variant of SmartQSM (torch + spconv-cu126, several GB). A separate tag, so the CPU and GPU images
+  # coexist and switching never rebuilds. In the `gpu` profile: a plain `docker compose build` skips it;
+  # `docker compose --profile gpu build` (run_pipeline.bat --gpu) builds it in addition to the other images.
+  smartqsm-gpu:
+    image: lidar-smartqsm-gpu
+    profiles: [gpu]
+    build:
+      context: .
+      dockerfile: docker/smartqsm/Dockerfile
+      args:
+        WITH_GPU: "1"
+        # torch 2.14.1+cu126 (the Dockerfile default) and exactly this spconv wheel; cumm follows from requirements.lock.txt
+        SPCONV_PACKAGE: "spconv-cu126==2.3.8"
+
+  arbor:
+    image: lidar-arbor
+    build:
+      context: .
+      dockerfile: docker/arbor/Dockerfile
+
+  bridge:
+    image: lidar-bridge
+    build:
+      context: .
+      dockerfile: docker/bridge/Dockerfile
+    working_dir: /workspace
+    # On `docker stop` / Ctrl+C the bridge kills the stage containers it started before it exits; give it time to do so.
+    stop_grace_period: 30s
+    environment:
+      HOST_PROJECT_DIR: "${HOST_PROJECT_DIR:?run via run_pipeline.bat, or set HOST_PROJECT_DIR=D:/path/to/project}"
+    volumes:
+      - .:/workspace
+      - /var/run/docker.sock:/var/run/docker.sock

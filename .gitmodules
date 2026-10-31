@@ -1,0 +1,9 @@
+[submodule "third_party/3DFin"]
+	path = third_party/3DFin
+	url = https://github.com/3DFin/3DFin.git
+[submodule "third_party/SmartQSM"]
+	path = third_party/SmartQSM
+	url = https://github.com/project-lightlin/SmartQSM.git
+[submodule "third_party/arbor"]
+	path = third_party/arbor
+	url = https://github.com/r-lidar/arbor.git

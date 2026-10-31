@@ -1,0 +1,14 @@
+# Build context is the repo root, so keep it small: no data, no VCS metadata.
+.git
+**/.git
+data
+Example_data
+*.laz
+*.las
+*.ply
+*.mat
+segfix-*-setup.exe
+**/__pycache__
+**/*.pyc
+.venv
+.pytest_cache

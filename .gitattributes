@@ -1,0 +1,12 @@
+# Force LF everywhere: CRLF breaks shell scripts and R Makevars inside the Linux images.
+* text=auto eol=lf
+
+# ...except Windows batch files, which cmd.exe needs as CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+*.laz binary
+*.las binary
+*.ply binary
+*.mat binary
+*.png binary

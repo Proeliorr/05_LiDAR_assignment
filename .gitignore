@@ -1,0 +1,21 @@
+# User data (large, not part of the environment)
+Example_data/
+segfix-*-setup.exe
+
+# Pipeline input / output (keep the folders only)
+data/in/*
+data/out/*
+!data/in/.gitkeep
+!data/out/.gitkeep
+
+# Python / tooling
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# hydra
+outputs/
+multirun/
