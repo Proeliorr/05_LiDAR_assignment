@@ -1,13 +1,15 @@
-# Build context is the repo root, so keep it small: no data, no VCS metadata.
+# Build context is the repo root, so keep it small: no data, no VCS metadata, nothing that is local only.
 .git
 **/.git
+.claude
 data
-Example_data
+report
+docs
+bridge/tests
 *.laz
 *.las
 *.ply
 *.mat
-segfix-*-setup.exe
 **/__pycache__
 **/*.pyc
 .venv

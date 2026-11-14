@@ -1,7 +1,6 @@
 #!/bin/bash
-# in-env <environment> <command> [args...]: run a command in a mamba environment.
-# `exec` after a real activation, not `conda run`: activation scripts set GDAL_DATA, PROJ_DATA and the like, and exec hands
-# stdin, output and signals straight to the tool.
+# in-env <environment> <command> [args...]: run a command inside a mamba environment.
+# Activates it properly and then execs, so stdin and signals reach the command.
 set -e
 env_name="$1"
 shift

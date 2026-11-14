@@ -1,4 +1,4 @@
-# R and the dependencies of arbor. arbor itself is compiled from third_party/arbor (see the Dockerfile).
+# R and the dependencies of arbor. arbor itself is installed from third_party/arbor by the Dockerfile.
 name: arbor
 channels:
   - conda-forge

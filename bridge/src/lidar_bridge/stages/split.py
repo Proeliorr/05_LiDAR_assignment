@@ -512,6 +512,10 @@ def run_split(
     min_z0: float = 0.10,
     min_points: int = 500,
     emit_ground_variant: bool = False,
+    key: str | None = None,
+    key_sheet: str | int = 0,
+    key_columns: dict | None = None,
+    id_dim: str = "treeID",
 ) -> dict:
     """Split ``dfin/<stem>_tree_ID_dist_axes.las`` into per-tree clouds ``split/trees/tree_XXXX.laz`` + ``tree_map.csv``.
 
@@ -533,7 +537,15 @@ def run_split(
     emit_ground_variant
         Additionally write ``trees_ground/``: each tree's points plus a ground skirt (``Z0 >= -0.5`` and
         ``Z >= stem_ground_z - 0.5``).
+    key, key_sheet, key_columns, id_dim
+        Start from a cloud already segmented by arbor instead of 3DFin's result: ``key`` is a table (xlsx sheet or csv,
+        relative to the data folder) listing the trees to cut out of the input cloud by their ``id_dim`` value, see
+        :mod:`lidar_bridge.stages.segmented`. The other parameters are not used then except ``min_points``.
     """
+    if key is not None:
+        from lidar_bridge.stages.segmented import run_segmented_split  # imports this module
+
+        return run_segmented_split(ctx, key, key_sheet, key_columns, id_dim, min_points)
     if not max_axis_dist > 0:
         raise StageError(f"split.max_axis_dist must be > 0, got {max_axis_dist}")
     if min_points < 0:

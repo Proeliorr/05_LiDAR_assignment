@@ -1,7 +1,9 @@
-# Python for 3DFin. Its packages come from pip, as listed in third_party/3DFin/pyproject.toml (see the Dockerfile).
+# Python for 3DFin; the 3DFin package itself is built from third_party/3DFin in the Dockerfile.
 name: 3dfin
 channels:
   - conda-forge
 dependencies:
   - python=3.12
   - pip
+  - pip:
+      - build

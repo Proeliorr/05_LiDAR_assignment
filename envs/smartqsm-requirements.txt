@@ -1,7 +1,6 @@
-# pip freeze of the CPU build of docker/smartqsm/Dockerfile (python:3.12-bookworm, SmartQSM v2.3.1, CPU torch + spconv).
-# Used as a pip constraints file (-c), not as a requirements list. torch is filtered out by the Dockerfile
-# (it comes from the PyTorch index; its version is the TORCH_VERSION build arg). Regenerate after a deliberate bump:
-#   docker run --rm --entrypoint pip lidar-smartqsm freeze   (then keep these header lines)
+# SmartQSM environment: pip freeze of the working GPU image (torch 2.14.1 built for CUDA 12.6).
+# Regenerate: docker run --rm --entrypoint in-env lidar-pipeline smartqsm pip freeze  (keep these header lines and the next one)
+--extra-index-url https://download.pytorch.org/whl/cu126
 absl-py==2.5.1
 annotated-types==0.8.0
 asttokens==3.0.2
@@ -19,7 +18,10 @@ cloudpickle==3.1.2
 comm==0.2.3
 ConfigArgParse==1.9.0
 contourpy==1.4.0
-cumm==0.7.11
+cuda-bindings==12.9.10
+cuda-pathfinder==1.8.5
+cuda-toolkit==12.6.3
+cumm-cu126==0.7.11
 cvxpy==1.9.3
 cycler==0.12.1
 dash==4.4.1
@@ -38,6 +40,7 @@ grpcio==1.85.0
 highspy==1.15.1
 idna==3.20
 importlib_metadata==10.1.0
+iniconfig==2.3.1
 ipython==9.17.1
 ipython_pygments_lexers==1.1.1
 ipywidgets==8.1.9
@@ -68,6 +71,21 @@ networkx==3.7
 ninja==1.13.2
 numba==0.68.1
 numpy==2.5.4
+nvidia-cublas-cu12==12.6.4.1
+nvidia-cuda-cupti-cu12==12.6.80
+nvidia-cuda-nvrtc-cu12==12.6.85
+nvidia-cuda-runtime-cu12==12.6.77
+nvidia-cudnn-cu12==9.10.2.21
+nvidia-cufft-cu12==11.3.0.4
+nvidia-cufile-cu12==1.11.1.6
+nvidia-curand-cu12==10.3.7.77
+nvidia-cusolver-cu12==11.7.1.2
+nvidia-cusparse-cu12==12.5.4.2
+nvidia-cusparselt-cu12==0.7.1
+nvidia-nccl-cu12==2.29.3
+nvidia-nvjitlink-cu12==12.9.86
+nvidia-nvshmem-cu12==3.4.5
+nvidia-nvtx-cu12==12.6.77
 odfpy==1.4.1
 open3d==0.20.0
 openpyxl==3.1.5
@@ -80,6 +98,7 @@ pexpect==4.9.0
 pillow==13.0.0
 platformdirs==4.14.0
 plotly==7.1.0
+pluggy==1.7.0
 portalocker==4.4.2
 prompt_toolkit==3.0.53
 protobuf==7.36.2
@@ -96,6 +115,7 @@ pyparsing==3.3.3
 pypcd4==1.5.1
 pyperclip==1.11.0
 pyproj==3.8.0
+pytest==9.2.0
 python-calamine==0.9.0
 python-dateutil==3.0.0
 python-neo-lzf==0.3.5
@@ -115,7 +135,7 @@ shapely==2.2.0
 six==1.17.0
 soupsieve==3.0.4
 sparsediffpy==0.6.1
-spconv==2.3.8
+spconv-cu126==2.3.8
 stack-data==0.6.3
 sympy==1.14.0
 tensorboard==2.21.0
@@ -123,15 +143,17 @@ tensorboard-data-server==0.7.2
 tensorboardX==2.6.5
 termcolor==3.3.0
 threadpoolctl==3.7.0
-torch==2.15.0+cpu
+torch==2.14.1+cu126
 tqdm==4.70.1
 traitlets==5.16.1
+triton==3.8.0
 typing-inspection==0.4.4
 typing_extensions==4.16.0
 tzdata==2026.6
 urllib3==2.8.0
 wcwidth==0.9.4
 Werkzeug==3.1.9
+wheel==0.48.0
 widgetsnbextension==4.0.16
 xlrd==2.0.2
 xlsxwriter==3.3.0

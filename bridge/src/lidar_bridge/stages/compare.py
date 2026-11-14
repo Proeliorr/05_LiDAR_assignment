@@ -557,9 +557,9 @@ def run_compare(
     Parameters
     ----------
     columns_file
-        Optional YAML (relative to the project) with the column mapping, sheet and csv options, see
-        ``configs/reference_columns.example.yaml``. Precedence per setting: explicit parameter below > YAML >
-        auto-detection by column title.
+        Optional YAML (relative to the project) with the column mapping, sheet and csv options, see the docstring of
+        :mod:`lidar_bridge.reference`. Precedence per setting: explicit parameter below > YAML > auto-detection by
+        column title.
     tree_id_col, dbh_col, height_col
         Column titles in the reference table (``None``: auto-detect by aliases such as ``nr``, ``dbh``, ``d1.3``,
         ``h``, ``wysokość``; ambiguous or unknown columns are an error that lists the columns found).

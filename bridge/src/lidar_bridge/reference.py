@@ -25,7 +25,7 @@ plain ``DBH`` title?) or above 150 (millimetres?), or a height median above 120 
 :class:`StageError` that names the setting to change. With an explicit unit (parameter, YAML, column title) the
 same kind of mismatch only logs a warning, since the user has stated what the numbers are.
 
-YAML column mapping (``compare.columns_file``), all keys optional, see ``configs/reference_columns.example.yaml``::
+YAML column mapping (``compare.columns_file``), all keys optional::
 
     sheet: 0              # xlsx: sheet name or 0-based index
     header_row: 0         # 0-based row with the column titles (counting non-empty rows only)
